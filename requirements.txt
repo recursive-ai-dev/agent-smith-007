@@ -1,0 +1,16 @@
+# Smith - Algebraic Symbolism Text Generation System
+# Minimal dependencies by design
+# Python 3.10+ required for structural pattern matching
+
+# Required: For safetensor checkpointing
+safetensors>=0.4.0
+
+# Optional: For visualization in notebooks
+matplotlib>=3.5.0
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+
+# Optional: For Jupyter notebook support
+jupyter>=1.0.0
+ipython>=7.0.0
