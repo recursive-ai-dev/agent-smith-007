@@ -40,7 +40,6 @@ __all__ = [
     "SymbolicDB",
     "GatedRecurrentUnit",
     "Trainer",
-    "SafetensorCheckpoint",
     "Concept",
     "Subconcept",
     "Betaconcept",
@@ -53,3 +52,6 @@ __all__ = [
     "DomainError",
     "TrafficCorpusBuilder",
 ]
+
+if SafetensorCheckpoint is not None:
+    __all__.append("SafetensorCheckpoint")

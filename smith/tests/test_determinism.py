@@ -2,7 +2,7 @@ import unittest
 import unittest
 import os
 import shutil
-from smith import SymbolicDB, GatedRecurrentUnit, Trainer
+from smith import SymbolicDB, GatedRecurrentUnit, Trainer, NanoTensor
 
 class TestDeterminism(unittest.TestCase):
     def setUp(self):
@@ -35,12 +35,15 @@ class TestDeterminism(unittest.TestCase):
         return final_params, history
 
     def test_bit_for_bit_determinism(self):
+        NanoTensor._global_index = 0
         params1, history1 = self.run_training(self.db_path1)
+        NanoTensor._global_index = 0
         params2, history2 = self.run_training(self.db_path2)
 
         for k in params1:
             self.assertEqual(params1[k], params2[k], f"Mismatch in parameter {k}")
 
+        self.assertEqual(len(history1), len(history2), "History lengths are not equal")
         for i in range(len(history1)):
             self.assertEqual(history1[i]['loss'], history2[i]['loss'], f"Loss mismatch at epoch {i+1}")
 

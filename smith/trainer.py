@@ -92,7 +92,7 @@ class Trainer:
         total_norm_sq = 0.0
         # Sort keys to ensure deterministic summation order
         sorted_params = sorted(self.model.params.items())
-        for name, param in sorted_params:
+        for _name, param in sorted_params:
             if param.grad:
                 for g in param.grad:
                     total_norm_sq += g * g
@@ -101,7 +101,7 @@ class Trainer:
         
         if grad_norm > self.clip_grad:
             scale = self.clip_grad / (grad_norm + 1e-8)
-            for name, param in sorted_params:
+            for _name, param in sorted_params:
                 if param.grad:
                     param.grad = [g * scale for g in param.grad]
                     # Also scale the Kahan error buffer to maintain consistency
@@ -112,7 +112,7 @@ class Trainer:
     def update_parameters(self):
         """Update model parameters using gradient descent."""
         # Sort keys for deterministic update order (important for some distributed/sharded scenarios)
-        for name, param in sorted(self.model.params.items()):
+        for _name, param in sorted(self.model.params.items()):
             if param.grad:
                 for i in range(len(param.data)):
                     param.data[i] -= self.learning_rate * param.grad[i]
