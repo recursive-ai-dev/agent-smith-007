@@ -3,6 +3,7 @@ Trainer - Training Interface for SymbolicRNN
 
 Provides a high-level training loop with progress tracking,
 model saving, and evaluation.
+Deterministic Hardening: High-precision gradient accumulation and deterministic sequence sampling.
 """
 
 import math
@@ -68,16 +69,15 @@ class Trainer:
         loss = NanoTensor([loss_val])
         
         # Manually set up gradient computation for softmax + NLL
-        # This is simplified for the minimal implementation
         def _backward():
             if logits.requires_grad:
                 # Gradient of softmax + NLL
                 probs = [e / (sum_exp + 1e-8) for e in exp_logits]
                 for i in range(len(logits.grad)):
                     if i == target:
-                        logits.grad[i] += (probs[i] - 1.0) * loss.grad[0]
+                        logits._accumulate_grad(i, (probs[i] - 1.0) * loss.grad[0])
                     else:
-                        logits.grad[i] += probs[i] * loss.grad[0]
+                        logits._accumulate_grad(i, probs[i] * loss.grad[0])
         
         loss._backward = _backward
         loss._parents = (logits,)
@@ -87,29 +87,32 @@ class Trainer:
     def clip_gradients(self) -> float:
         """
         Clip gradients to prevent exploding gradients.
-        
-        Returns:
-            Gradient norm before clipping
+        Deterministic accumulation of norm squared.
         """
-        total_norm = 0.0
-        for param in self.model.params.values():
+        total_norm_sq = 0.0
+        # Sort keys to ensure deterministic summation order
+        sorted_params = sorted(self.model.params.items())
+        for name, param in sorted_params:
             if param.grad:
                 for g in param.grad:
-                    total_norm += g * g
+                    total_norm_sq += g * g
         
-        grad_norm = math.sqrt(total_norm)
+        grad_norm = math.sqrt(total_norm_sq)
         
         if grad_norm > self.clip_grad:
             scale = self.clip_grad / (grad_norm + 1e-8)
-            for param in self.model.params.values():
+            for name, param in sorted_params:
                 if param.grad:
                     param.grad = [g * scale for g in param.grad]
+                    # Also scale the Kahan error buffer to maintain consistency
+                    param._grad_err = [e * scale for e in param._grad_err]
         
         return grad_norm
     
     def update_parameters(self):
         """Update model parameters using gradient descent."""
-        for param in self.model.params.values():
+        # Sort keys for deterministic update order (important for some distributed/sharded scenarios)
+        for name, param in sorted(self.model.params.items()):
             if param.grad:
                 for i in range(len(param.data)):
                     param.data[i] -= self.learning_rate * param.grad[i]
@@ -121,13 +124,6 @@ class Trainer:
     ) -> Tuple[float, float]:
         """
         Perform one training step.
-        
-        Args:
-            inputs: List of input token IDs
-            targets: List of target token IDs
-            
-        Returns:
-            Tuple of (Average loss for this step, Gradient norm)
         """
         self.model.zero_grad()
         
@@ -165,14 +161,6 @@ class Trainer:
     ):
         """
         Train the model on text data.
-        
-        Args:
-            text: Training text
-            epochs: Number of training epochs
-            seq_length: Length of training sequences
-            save_every: Save model every N epochs
-            eval_every: Evaluate model every N epochs
-            callback: Optional callback function(epoch, loss, sample_text)
         """
         # Convert text to token IDs
         token_ids = [ord(c) % self.model.vocab_size for c in text]
@@ -189,12 +177,12 @@ class Trainer:
         for epoch in range(1, epochs + 1):
             epoch_start = time.time()
             
-            # Sample random starting position
+            # Deterministic starting position based on epoch
             if len(token_ids) <= seq_length + 1:
-                # If text is too short, just use the whole thing
                 start_idx = 0
             else:
-                start_idx = epoch % (len(token_ids) - seq_length - 1)
+                # Linear scan through dataset for deterministic coverage
+                start_idx = (epoch - 1) % (len(token_ids) - seq_length)
             
             # Get input and target sequences
             inputs = token_ids[start_idx:start_idx + seq_length]
@@ -227,7 +215,6 @@ class Trainer:
             
             # Generate sample
             if epoch % eval_every == 0:
-                # Generate a short sample
                 seed = text[:5] if len(text) >= 5 else text
                 sample = self.model.generate(seed, length=20, temperature=0.7)
                 
@@ -235,7 +222,6 @@ class Trainer:
                     print(f"Sample: {repr(sample)}")
                     print("-" * 60)
                 
-                # Call callback if provided
                 if callback:
                     callback(epoch, loss, sample)
             
@@ -251,5 +237,4 @@ class Trainer:
             print(f"Final loss: {self.training_history[-1]['loss']:.4f}")
     
     def get_history(self) -> List[Dict[str, Any]]:
-        """Get training history."""
         return self.training_history
