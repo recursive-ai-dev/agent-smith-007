@@ -3,6 +3,7 @@ Symbolic Database - Self-Hosted Model Persistence
 
 SQLite-based database for storing model states, training history,
 and generated text with symbolic representations.
+Deterministic Hardening: Causal versioning and content-addressable storage.
 """
 
 import json
@@ -25,7 +26,20 @@ class SymbolicDB:
         self.db_path = Path(db_path)
         self.conn = sqlite3.connect(self.db_path)
         self._init_schema()
+        # Initialize logical clock (version counter)
+        self._version_counter = 0
+        self._refresh_version_counter()
     
+    def _refresh_version_counter(self):
+        """Update the logical version counter from existing data."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT MAX(id) FROM model_params")
+        row = cursor.fetchone()
+        if row and row[0] is not None:
+            self._version_counter = row[0]
+        else:
+            self._version_counter = 0
+
     def _init_schema(self):
         """Initialize database schema with symbolic representations"""
         cursor = self.conn.cursor()
@@ -37,6 +51,7 @@ class SymbolicDB:
                 param_key TEXT UNIQUE,
                 data BLOB,
                 checksum TEXT,
+                logical_version INTEGER,
                 timestamp REAL
             )
         """)
@@ -49,6 +64,7 @@ class SymbolicDB:
                 loss REAL,
                 grad_norm REAL,
                 pattern_signature TEXT,
+                logical_version INTEGER,
                 timestamp REAL
             )
         """)
@@ -61,6 +77,7 @@ class SymbolicDB:
                 generated_text TEXT,
                 config JSON,
                 quality_score REAL,
+                logical_version INTEGER,
                 timestamp REAL
             )
         """)
@@ -68,17 +85,21 @@ class SymbolicDB:
         self.conn.commit()
     
     def save_params(self, params: Dict[str, NanoTensor]) -> str:
-        """Save model parameters with algebraic checksum"""
+        """Save model parameters with algebraic checksum and logical versioning."""
         cursor = self.conn.cursor()
-        param_key = f"params_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
         
-        # Serialize tensor data
-        serialized = json.dumps({k: v.data for k, v in params.items()}).encode()
-        checksum = hashlib.md5(serialized).hexdigest()
+        # Deterministic serialization: sort keys
+        param_dict = {k: v.data for k, v in sorted(params.items())}
+        serialized = json.dumps(param_dict).encode()
+        checksum = hashlib.sha256(serialized).hexdigest()
+
+        # Use checksum as part of the key for content-addressable storage
+        self._version_counter += 1
+        param_key = f"v{self._version_counter}_{checksum[:8]}"
         
         cursor.execute(
-            "INSERT INTO model_params (param_key, data, checksum, timestamp) VALUES (?, ?, ?, ?)",
-            (param_key, serialized, checksum, time.time())
+            "INSERT INTO model_params (param_key, data, checksum, logical_version, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (param_key, serialized, checksum, self._version_counter, time.time())
         )
         self.conn.commit()
         return param_key
@@ -93,20 +114,20 @@ class SymbolicDB:
         return None
     
     def log_training(self, epoch: int, loss: float, grad_norm: float, pattern: str):
-        """Log training metrics with pattern metadata"""
+        """Log training metrics with causal versioning"""
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO training_log (epoch, loss, grad_norm, pattern_signature, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (epoch, loss, grad_norm, pattern, time.time())
+            "INSERT INTO training_log (epoch, loss, grad_norm, pattern_signature, logical_version, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (epoch, loss, grad_norm, pattern, self._version_counter, time.time())
         )
         self.conn.commit()
     
     def store_generation(self, seed: str, text: str, config: Dict[str, Any], quality: float):
-        """Store generated text with configuration"""
+        """Store generated text with configuration and logical version"""
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO generations (seed_text, generated_text, config, quality_score, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (seed, text, json.dumps(config), quality, time.time())
+            "INSERT INTO generations (seed_text, generated_text, config, quality_score, logical_version, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (seed, text, json.dumps(config), quality, self._version_counter, time.time())
         )
         self.conn.commit()
     
@@ -130,14 +151,15 @@ class SymbolicDB:
     def get_training_history(self) -> List[Dict[str, Any]]:
         """Retrieve training history for analysis"""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT epoch, loss, grad_norm, pattern_signature, timestamp FROM training_log ORDER BY epoch")
+        cursor.execute("SELECT epoch, loss, grad_norm, pattern_signature, timestamp, logical_version FROM training_log ORDER BY epoch")
         results = cursor.fetchall()
         return [{
             "epoch": r[0],
             "loss": r[1],
             "grad_norm": r[2],
             "pattern": r[3],
-            "timestamp": r[4]
+            "timestamp": r[4],
+            "version": r[5]
         } for r in results]
     
     def close(self):

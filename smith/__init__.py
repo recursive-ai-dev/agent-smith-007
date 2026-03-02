@@ -15,7 +15,12 @@ from .pattern_matcher import PatternMatcher, Token
 from .database import SymbolicDB
 from .gru_model import GatedRecurrentUnit
 from .trainer import Trainer
-from .checkpoint import SafetensorCheckpoint
+
+try:
+    from .checkpoint import SafetensorCheckpoint
+except ImportError:
+    SafetensorCheckpoint = None
+
 from .hsws import Concept, Subconcept, Betaconcept, SimpleSemanticEngine
 from .stiv import (
     STIV,

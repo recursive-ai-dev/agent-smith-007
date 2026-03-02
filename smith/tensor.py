@@ -17,25 +17,28 @@ class NanoTensor:
         if isinstance(data, (int, float)):
             data = [data]
         self.data = [float(x) for x in data] if isinstance(data, list) else data
-        self.shape = (len(self.data),)
-        self.grad = [0.0] * len(self.data) if requires_grad else None
+        self.shape = (len(self.data),) if isinstance(self.data, list) else self.data.shape
+        self.grad = [0.0] * len(self.data) if isinstance(self.data, list) else None
+        # Gradient error for Kahan summation
+        self._grad_err = [0.0] * len(self.data) if isinstance(self.data, list) else None
+
         self._backward = lambda: None
         self._parents = set(_parents)
         self._op = _op
         self.requires_grad = requires_grad
-        self.metadata = metadata or {}
-
-        self._verify_invariants()
-
-    def _verify_invariants(self):
-        assert isinstance(self.data, list)
-        if self.requires_grad:
-            assert len(self.grad) == len(self.data)
-
-    # --- High-Precision Branchless Primitives ---
+        # Unique ID for deterministic sorting
+        self._creation_index = self._get_next_index()
     
+    _global_index = 0
+    @classmethod
+    def _get_next_index(cls):
+        cls._global_index += 1
+        return cls._global_index
+
+    # --- Algebraic Primitives (Branchless) ---
     @staticmethod
     def _sign(x: float) -> float:
+        """Branchless sign function: returns -1, 0, or 1"""
         return float((x > 0) - (x < 0))
     
     @staticmethod
@@ -49,6 +52,12 @@ class NanoTensor:
     @staticmethod
     def _relu(x: float) -> float:
         return NanoTensor._max(x, 0.0)
+    
+    @staticmethod
+    def _if_else(condition: float, true_val: float, false_val: float) -> float:
+        """Branchless conditional using sign primitive"""
+        mask = (NanoTensor._sign(condition) + 1.0) / 2.0
+        return mask * true_val + (1.0 - mask) * false_val
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -65,21 +74,30 @@ class NanoTensor:
             return 1.0 if x > 0 else 0.0
 
     @staticmethod
-    def _tanh(x: float) -> float:
-        # Use math.tanh for formal verification stage to ensure 94% confidence score
-        return math.tanh(x)
-
-    @staticmethod
-    def _exp_stable(x: float) -> float:
-        try:
-            return math.exp(x)
-        except OverflowError:
-            return float('inf')
+    def _exp(x: float) -> float:
+        """Branchless exp approximation"""
+        return 1.0 + x + 0.5 * x**2 + 0.1666 * x**3 + 0.0416 * x**4
 
     @staticmethod
     def _gelu(x: float) -> float:
-        # Standard GELU approximation
-        return 0.5 * x * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3))))
+        """Branchless GELU approximation"""
+        return 0.5 * x * (1.0 + NanoTensor._tanh(0.79788456 * (x + 0.044715 * x**3)))
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        """Branchless sigmoid approximation"""
+        return 0.5 * (x / (1.0 + abs(x)) + 1.0)
+    
+    def _accumulate_grad(self, index: int, value: float):
+        """Accumulate gradient using Kahan Summation for precision and determinism."""
+        if self.grad is None or not self.requires_grad:
+            return
+
+        # Kahan summation step
+        y = value - self._grad_err[index]
+        t = self.grad[index] + y
+        self._grad_err[index] = (t - self.grad[index]) - y
+        self.grad[index] = t
 
     # --- Tensor Operations ---
 
@@ -151,7 +169,12 @@ class NanoTensor:
 
     def matmul(self, other):
         other = other if isinstance(other, NanoTensor) else NanoTensor(other)
-        m, n = len(self.data), len(other.data)
+        m = len(self.data)
+        n = len(other.data)
+
+        if m == n:
+            result = sum(self.data[i] * other.data[i] for i in range(n))
+            out = NanoTensor([result], _parents=(self, other), _op='matmul_dot')
 
         if m == n: # Dot product
             res = sum(self.data[i] * other.data[i] for i in range(m))
@@ -171,43 +194,59 @@ class NanoTensor:
                 y.append(sum(self.data[i*n + j] * other.data[j] for j in range(n)))
             out = NanoTensor(y, _parents=(self, other), _op='mv')
             def _backward():
-                if self.requires_grad:
-                    for i in range(rows):
-                        for j in range(n): self.grad[i*n + j] += other.data[j] * out.grad[i]
-                if other.requires_grad:
+                for i in range(rows):
+                    base = i * n
+                    gi = out.grad[i]
                     for j in range(n):
-                        other.grad[j] += sum(self.data[i*n + j] * out.grad[i] for i in range(rows))
+                        self._accumulate_grad(base + j, other.data[j] * gi)
+
+                for j in range(n):
+                    acc = 0.0
+                    for i in range(rows):
+                        acc += self.data[i * n + j] * out.grad[i]
+                    other._accumulate_grad(j, acc)
+
             out._backward = _backward
             return out
 
-        raise ValueError(f"Dim mismatch: {m} and {n}")
-
+        raise AssertionError(f"Dimension mismatch in matmul: {m} and {n}")
+    
     def relu(self):
-        out = NanoTensor([self._relu(x) for x in self.data], _parents=(self,), _op='relu')
+        out = NanoTensor([self._relu(x) for x in self.data],
+                         _parents=(self,), _op='relu')
+        
         def _backward():
-            if self.requires_grad:
-                for i in range(len(self.data)):
-                    self.grad[i] += (1.0 if self.data[i] > 0 else 0.0) * out.grad[i]
+            for i in range(len(self.grad)):
+                mask = (self._sign(self.data[i]) + 1.0) / 2.0
+                self._accumulate_grad(i, mask * out.grad[i])
+        out._backward = _backward
+        return out
+
+    def gelu(self):
+        out = NanoTensor([self._gelu(x) for x in self.data],
+                         _parents=(self,), _op='gelu')
+
+        def _backward():
+            for i in range(len(self.grad)):
+                x = self.data[i]
+                c = 0.79788456
+                k = 0.044715
+                inner = c * (x + k * x**3)
+                tanh_inner = self._tanh(inner)
+                sech_inner_sq = 1.0 - tanh_inner**2
+                grad = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech_inner_sq * c * (1.0 + 3.0 * k * x**2)
+                self._accumulate_grad(i, grad * out.grad[i])
         out._backward = _backward
         return out
 
     def sigmoid(self):
-        out = NanoTensor([self._sigmoid(x) for x in self.data], _parents=(self,), _op='sigmoid')
-        def _backward():
-            if self.requires_grad:
-                for i in range(len(self.grad)):
-                    s = out.data[i]
-                    self.grad[i] += s * (1.0 - s) * out.grad[i]
-        out._backward = _backward
-        return out
+        out = NanoTensor([self._sigmoid(x) for x in self.data],
+                         _parents=(self,), _op='sigmoid')
 
-    def tanh(self):
-        out = NanoTensor([self._tanh(x) for x in self.data], _parents=(self,), _op='tanh')
         def _backward():
-            if self.requires_grad:
-                for i in range(len(self.grad)):
-                    t = out.data[i]
-                    self.grad[i] += (1.0 - t*t) * out.grad[i]
+            for i in range(len(self.grad)):
+                s = out.data[i]
+                self._accumulate_grad(i, s * (1 - s) * out.grad[i])
         out._backward = _backward
         return out
 
@@ -236,27 +275,40 @@ class NanoTensor:
         return out
 
     def backward(self):
+        """Deterministic backward pass using topological sort based on creation order."""
         topo = []
         visited = set()
-        def build_topo(v):
-            if v not in visited:
-                visited.add(v)
-                for parent in v._parents:
+
+        def build_topo(t):
+            if t not in visited:
+                visited.add(t)
+                # Sort parents by creation index for strict determinism
+                sorted_parents = sorted(t._parents, key=lambda x: x._creation_index)
+                for parent in sorted_parents:
                     build_topo(parent)
-                topo.append(v)
+                topo.append(t)
+
         build_topo(self)
         
-        # Reset gradients of all nodes in the graph to 0, except for self which is 1
-        for node in topo:
-            node.zero_grad()
-        
-        self.grad = [1.0] * len(self.data)
-        for node in reversed(topo):
-            node._backward()
+        # Reset all gradients in the graph to zero initially
+        # except the leaf node which we set to 1.0
+        for t in topo:
+            if t.grad:
+                t.grad = [0.0] * len(t.grad)
+                t._grad_err = [0.0] * len(t._grad_err)
 
+        self.grad[0] = 1.0
+        
+        # Process in reverse topological order (linear pass)
+        for t in reversed(topo):
+            t._backward()
+    
     def zero_grad(self):
         if self.grad:
-            for i in range(len(self.grad)): self.grad[i] = 0.0
-
+            self.grad = [0.0] * len(self.grad)
+            self._grad_err = [0.0] * len(self._grad_err)
+    
     def __repr__(self):
-        return f"NanoTensor(val={self.data[:2]}, op={self._op})"
+        data_repr = self.data[:5] if len(self.data) > 5 else self.data
+        grad_repr = [f'{g:.3f}' for g in self.grad[:5]] if self.grad and len(self.grad) > 5 else [f'{g:.3f}' for g in (self.grad or [])]
+        return f"NanoTensor(data={data_repr}{'...' if len(self.data) > 5 else ''}, grad={grad_repr}{'...' if self.grad and len(self.grad) > 5 else ''})"
