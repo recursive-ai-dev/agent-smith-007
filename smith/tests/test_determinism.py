@@ -35,10 +35,14 @@ class TestDeterminism(unittest.TestCase):
         return final_params, history
 
     def test_bit_for_bit_determinism(self):
-        NanoTensor._global_index = 0
-        params1, history1 = self.run_training(self.db_path1)
-        NanoTensor._global_index = 0
-        params2, history2 = self.run_training(self.db_path2)
+        original_global_index = NanoTensor._global_index
+        try:
+            NanoTensor._global_index = 0
+            params1, history1 = self.run_training(self.db_path1)
+            NanoTensor._global_index = 0
+            params2, history2 = self.run_training(self.db_path2)
+       finally:
+            NanoTensor._global_index = original_global_index
 
         for k in params1:
             self.assertEqual(params1[k], params2[k], f"Mismatch in parameter {k}")
