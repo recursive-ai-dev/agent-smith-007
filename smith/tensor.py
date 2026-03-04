@@ -1,6 +1,10 @@
 """
 NanoTensor - Lightweight Tensor with Automatic Differentiation
 High-Fidelity Refactor: AtomicGradient Edition
+
+Extended with full mathematical operations for AgentSmith classifier:
+  neg, sub, div, pow, exp, log, sqrt, tanh, softmax, mean, concat,
+  weighted_sum, extract — all with correct analytical backpropagation.
 """
 
 import math
@@ -274,32 +278,249 @@ class NanoTensor:
         out._backward = _backward
         return out
 
+    # ------------------------------------------------------------------
+    # Extended arithmetic
+    # ------------------------------------------------------------------
+
+    def __neg__(self):
+        """Negate all elements: -x.  ∂(-x_i)/∂x_i = -1."""
+        out = NanoTensor([-x for x in self.data], _parents=(self,), _op='neg')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, -out.grad[i])
+        out._backward = _backward
+        return out
+
+    def __sub__(self, other):
+        other = other if isinstance(other, NanoTensor) else NanoTensor([float(other)])
+        return self + (-other)
+
+    def __rsub__(self, other):
+        return NanoTensor([float(other)]) - self
+
+    def __truediv__(self, other):
+        if isinstance(other, (int, float)):
+            return self * NanoTensor([1.0 / other], requires_grad=False)
+        return self * other.reciprocal()
+
+    def __rtruediv__(self, other):
+        return NanoTensor([float(other)], requires_grad=False) * self.reciprocal()
+
+    def reciprocal(self):
+        """Element-wise 1/x.  ∂(1/x_i)/∂x_i = -1/x_i²."""
+        safe = [x if abs(x) > 1e-30 else (1e-30 if x >= 0 else -1e-30) for x in self.data]
+        out = NanoTensor([1.0 / s for s in safe], _parents=(self,), _op='recip')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, -out.data[i] ** 2 * out.grad[i])
+        out._backward = _backward
+        return out
+
+    def __pow__(self, exponent: float):
+        """Element-wise power x^k.  ∂(x_i^k)/∂x_i = k * x_i^(k-1)."""
+        out = NanoTensor([x ** exponent for x in self.data], _parents=(self,), _op=f'pow{exponent}')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    base = self.data[i]
+                    if base == 0.0:
+                        self._accumulate_grad(i, 0.0)
+                    else:
+                        self._accumulate_grad(i, exponent * (base ** (exponent - 1.0)) * out.grad[i])
+        out._backward = _backward
+        return out
+
+    # ------------------------------------------------------------------
+    # Transcendental operations
+    # ------------------------------------------------------------------
+
+    def exp(self):
+        """Element-wise e^x.  ∂(e^x_i)/∂x_i = e^x_i."""
+        # Clamp to prevent inf
+        out = NanoTensor([math.exp(min(x, 88.72)) for x in self.data], _parents=(self,), _op='exp')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, out.data[i] * out.grad[i])
+        out._backward = _backward
+        return out
+
+    def log(self):
+        """Element-wise natural log.  ∂log(x_i)/∂x_i = 1/x_i."""
+        safe = [max(x, 1e-30) for x in self.data]
+        out = NanoTensor([math.log(s) for s in safe], _parents=(self,), _op='log')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, (1.0 / safe[i]) * out.grad[i])
+        out._backward = _backward
+        return out
+
+    def sqrt(self):
+        """Element-wise sqrt(x).  ∂sqrt(x_i)/∂x_i = 1 / (2*sqrt(x_i))."""
+        safe = [max(x, 1e-30) for x in self.data]
+        out = NanoTensor([math.sqrt(s) for s in safe], _parents=(self,), _op='sqrt')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, 0.5 / out.data[i] * out.grad[i])
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        """Element-wise tanh.  ∂tanh(x_i)/∂x_i = 1 - tanh(x_i)²."""
+        out = NanoTensor([math.tanh(x) for x in self.data], _parents=(self,), _op='tanh')
+        def _backward():
+            if self.requires_grad:
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, (1.0 - out.data[i] ** 2) * out.grad[i])
+        out._backward = _backward
+        return out
+
+    @staticmethod
+    def _tanh(x: float) -> float:
+        return math.tanh(x)
+
+    def mean(self):
+        """Mean over all elements → scalar.  ∂mean/∂x_i = 1/n."""
+        n = len(self.data)
+        out = NanoTensor([sum(self.data) / n], _parents=(self,), _op='mean')
+        def _backward():
+            if self.requires_grad:
+                for i in range(n):
+                    self._accumulate_grad(i, out.grad[0] / n)
+        out._backward = _backward
+        return out
+
+    # ------------------------------------------------------------------
+    # Numerically-stable softmax with analytical Jacobian backprop
+    # ------------------------------------------------------------------
+
+    def softmax(self):
+        """
+        Softmax over all elements.
+        Forward:  p_i = exp(x_i - max_x) / sum_j exp(x_j - max_x)
+        Backward: ∂L/∂x_i = p_i (∂L/∂p_i  − Σ_j p_j ∂L/∂p_j)
+        """
+        max_x = max(self.data)
+        e = [math.exp(xi - max_x) for xi in self.data]
+        s = sum(e)
+        probs = [ei / s for ei in e]
+        out = NanoTensor(probs[:], _parents=(self,), _op='softmax')
+        def _backward():
+            if self.requires_grad:
+                dot = sum(probs[i] * out.grad[i] for i in range(len(probs)))
+                for i in range(len(self.grad)):
+                    self._accumulate_grad(i, probs[i] * (out.grad[i] - dot))
+        out._backward = _backward
+        return out
+
+    # ------------------------------------------------------------------
+    # Structural: concat, extract (slice), weighted_sum
+    # ------------------------------------------------------------------
+
+    def concat(self, other: 'NanoTensor') -> 'NanoTensor':
+        """
+        Concatenate two 1-D NanoTensors → [n1 + n2].
+        Gradient fan-out: upstream grad routed back to each source region.
+        """
+        n1, n2 = len(self.data), len(other.data)
+        out = NanoTensor(self.data + other.data, _parents=(self, other), _op='concat')
+        def _backward():
+            if self.requires_grad:
+                for i in range(n1):
+                    self._accumulate_grad(i, out.grad[i])
+            if other.requires_grad:
+                for i in range(n2):
+                    other._accumulate_grad(i, out.grad[n1 + i])
+        out._backward = _backward
+        return out
+
+    def extract(self, start: int, end: int) -> 'NanoTensor':
+        """
+        Extract a contiguous slice [start, end).
+        ∂L/∂x_i = ∂L/∂out_{i-start}  for i in [start, end), else 0.
+        """
+        length = end - start
+        out = NanoTensor(self.data[start:end], _parents=(self,), _op='extract')
+        def _backward():
+            if self.requires_grad:
+                for i in range(length):
+                    self._accumulate_grad(start + i, out.grad[i])
+        out._backward = _backward
+        return out
+
+    @staticmethod
+    def weighted_sum(weights: 'NanoTensor', values: 'List[NanoTensor]') -> 'NanoTensor':
+        """
+        Bilinear attention context:  out[d] = Σ_j weights[j] * values[j][d]
+
+        weights : NanoTensor [seq_len]
+        values  : list of seq_len NanoTensors, each [d_v]
+        Returns : NanoTensor [d_v]
+
+        Gradients:
+          ∂L/∂weights[j]  = Σ_d ∂L/∂out[d] * values[j][d]  = dot(∂L/∂out, v_j)
+          ∂L/∂values[j][d] = weights[j] * ∂L/∂out[d]
+        """
+        seq_len = len(weights.data)
+        d_v = len(values[0].data)
+        result = [
+            sum(weights.data[j] * values[j].data[d] for j in range(seq_len))
+            for d in range(d_v)
+        ]
+        out = NanoTensor(result, _parents=tuple([weights] + values), _op='wsum')
+        def _backward():
+            if weights.requires_grad:
+                for j in range(seq_len):
+                    gw = sum(out.grad[d] * values[j].data[d] for d in range(d_v))
+                    weights._accumulate_grad(j, gw)
+            for j, v in enumerate(values):
+                if v.requires_grad:
+                    for d in range(d_v):
+                        v._accumulate_grad(d, weights.data[j] * out.grad[d])
+        out._backward = _backward
+        return out
+
     def backward(self):
-        """Deterministic backward pass using topological sort based on creation order."""
-        topo = []
-        visited = set()
+        """
+        Iterative topological sort + reverse-mode AD.
+        Uses explicit stack (no recursion) to handle arbitrarily deep computation graphs.
+        Gradient accumulation via Kahan summation (inherited from _accumulate_grad).
+        """
+        # Iterative post-order DFS
+        topo: List['NanoTensor'] = []
+        visited: Set['NanoTensor'] = set()
+        stack = [(self, False)]
+        while stack:
+            node, processed = stack.pop()
+            if processed:
+                topo.append(node)
+                continue
+            if node in visited:
+                continue
+            visited.add(node)
+            stack.append((node, True))
+            for parent in sorted(node._parents, key=lambda x: x._creation_index):
+                if parent not in visited:
+                    stack.append((parent, False))
 
-        def build_topo(t):
-            if t not in visited:
-                visited.add(t)
-                # Sort parents by creation index for strict determinism
-                sorted_parents = sorted(t._parents, key=lambda x: x._creation_index)
-                for parent in sorted_parents:
-                    build_topo(parent)
-                topo.append(t)
-
-        build_topo(self)
-        
-        # Reset all gradients in the graph to zero initially
-        # except the leaf node which we set to 1.0
+        # Zero all gradients in the graph
         for t in topo:
-            if t.grad:
+            if t.grad is not None:
                 t.grad = [0.0] * len(t.grad)
                 t._grad_err = [0.0] * len(t._grad_err)
 
+        # Seed gradient at the root (must be a scalar)
+        if len(self.data) != 1:
+            raise ValueError(
+                f"backward() requires a scalar output; got shape {len(self.data)}"
+            )
         self.grad[0] = 1.0
-        
-        # Process in reverse topological order (linear pass)
+
+        # Propagate in reverse topological order
         for t in reversed(topo):
             t._backward()
     
