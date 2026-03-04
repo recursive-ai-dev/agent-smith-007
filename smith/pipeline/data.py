@@ -197,7 +197,8 @@ class Dataset:
 
     @classmethod
     def from_csv(cls, path: str, text_col: int = 0, label_col: int = 1,
-                 has_header: bool = True) -> 'Dataset':
+                 has_header: bool = True,
+                 num_classes: Optional[int] = None) -> 'Dataset':
         """Load from a CSV file with text and integer label columns."""
         samples = []
         with open(path, newline="", encoding="utf-8") as f:
@@ -210,13 +211,16 @@ class Dataset:
                 try:
                     label = int(row[label_col].strip())
                     text  = row[text_col].strip()
-                    samples.append((text, label))
                 except (ValueError, IndexError):
                     continue
+                if num_classes is not None and not (0 <= label < num_classes):
+                    continue
+                samples.append((text, label))
         return cls(samples)
 
     @classmethod
-    def from_txt(cls, path: str) -> 'Dataset':
+    def from_txt(cls, path: str,
+                 num_classes: Optional[int] = None) -> 'Dataset':
         """Load from a two-column TSV: label<TAB>text."""
         samples = []
         with open(path, encoding="utf-8") as f:
@@ -226,9 +230,12 @@ class Dataset:
                     continue
                 label_str, text = line.split("\t", 1)
                 try:
-                    samples.append((text.strip(), int(label_str.strip())))
+                    label = int(label_str.strip())
                 except ValueError:
                     continue
+                if num_classes is not None and not (0 <= label < num_classes):
+                    continue
+                samples.append((text.strip(), label))
         return cls(samples)
 
     def shuffle(self, seed: Optional[int] = None):
@@ -237,10 +244,13 @@ class Dataset:
         return self
 
     def split(self, val_fraction: float = 0.1) -> Tuple['Dataset', 'Dataset']:
-        """Split into train and validation sets."""
-        n_val   = max(1, int(len(self.samples) * val_fraction))
-        val     = Dataset(self.samples[:n_val])
-        train   = Dataset(self.samples[n_val:])
+        """Split into (shuffled) train and validation sets."""
+        samples = self.samples[:]
+        random.shuffle(samples)
+        n_val = int(round(len(samples) * val_fraction))
+        n_val = max(1, min(n_val, len(samples) - 1))
+        val   = Dataset(samples[:n_val])
+        train = Dataset(samples[n_val:])
         return train, val
 
     def __len__(self) -> int:

@@ -122,8 +122,12 @@ class GSAR:
         self._registry: Dict[Tuple[int, ...], SymbolEntry] = {}
 
         # ── Learnable symbol embeddings: list[NanoTensor ∈ ℝ^d_model]
-        #    Grown dynamically as symbols are registered.
-        self._sym_embeddings: List[NanoTensor] = []
+        #    Pre-allocated to max_symbols so AdamOptimizer sees them all
+        #    from the start; unused slots remain zero until a symbol is
+        #    registered and initialised.
+        self._sym_embeddings: List[NanoTensor] = [
+            NanoTensor([0.0] * d_model) for _ in range(max_symbols)
+        ]
 
     # ── Statistics update ────────────────────────────────────────────────
 
@@ -175,13 +179,13 @@ class GSAR:
                 continue
             p = self._compute_priority(count)
             if p >= self.priority_threshold:
-                sym_id = len(self._sym_embeddings)
+                sym_id = len(self._registry)   # index into pre-allocated slots
+                if sym_id >= self.max_symbols:
+                    break
                 entry  = SymbolEntry(sym_id, pattern, p, count)
                 self._registry[pattern] = entry
-                # Initialise embedding to zeros (will be set from token embs below)
-                self._sym_embeddings.append(
-                    NanoTensor([0.0] * self.d_model)
-                )
+                # Slot already exists (pre-allocated); leave data as zeros until
+                # initialise_symbol_embedding is called during the first forward pass.
                 newly_registered += 1
 
         return newly_registered
@@ -208,8 +212,11 @@ class GSAR:
             for d in range(self.d_model):
                 mean_data[d] += emb.data[d]
         n = len(pattern)
-        mean_data = [x / n for x in mean_data]
-        self._sym_embeddings[entry.symbol_id] = NanoTensor(mean_data)
+        # Update the pre-allocated slot in-place so AdamOptimizer's reference
+        # to this NanoTensor remains valid.
+        slot = self._sym_embeddings[entry.symbol_id]
+        for d in range(self.d_model):
+            slot.data[d] = mean_data[d] / n
 
     # ── Forward: compress a single token sequence ────────────────────────
 
@@ -265,23 +272,19 @@ class GSAR:
                     sym_emb = self._sym_embeddings[entry.symbol_id]
 
                 # ── Blend: α·sym + (1−α)·mean(token_embs)
-                alpha   = self.blend_alpha if self.blend_alpha is not None else entry.priority
+                alpha    = self.blend_alpha if self.blend_alpha is not None else entry.priority
                 tok_embs = [embed_fn(tid) for tid in window]
-                mean_data = [
-                    sum(te.data[d] for te in tok_embs) / ws
-                    for d in range(self.d_model)
-                ]
 
-                blended_data = [
-                    alpha * sym_emb.data[d] + (1.0 - alpha) * mean_data[d]
-                    for d in range(self.d_model)
-                ]
+                # Build mean_nt through NanoTensor ops so gradients flow into
+                # the token embeddings (not detached raw floats).
+                mean_nt = tok_embs[0]
+                for te in tok_embs[1:]:
+                    mean_nt = mean_nt + te
+                inv_ws   = NanoTensor([1.0 / ws] * self.d_model, requires_grad=False)
+                mean_nt  = mean_nt * inv_ws
 
-                # Build blended NanoTensor with gradient path through sym_emb
-                # (token embeddings also contribute through (1−α) branch)
-                mean_nt  = NanoTensor(mean_data, requires_grad=False)  # detached
-                alpha_t  = NanoTensor([alpha]   * self.d_model, requires_grad=False)
-                nalpha_t = NanoTensor([1.0 - alpha] * self.d_model, requires_grad=False)
+                alpha_t  = NanoTensor([alpha]         * self.d_model, requires_grad=False)
+                nalpha_t = NanoTensor([1.0 - alpha]   * self.d_model, requires_grad=False)
                 blended  = sym_emb * alpha_t + mean_nt * nalpha_t
 
                 embeddings.append(blended)
@@ -326,7 +329,9 @@ class GSAR:
         return dict(dist)
 
     def parameters(self) -> List[NanoTensor]:
-        """Return symbol embeddings as trainable parameters."""
+        """Return all pre-allocated symbol embeddings as trainable parameters.
+        All max_symbols slots are included so AdamOptimizer tracks them from
+        construction time, even before symbols are registered."""
         return list(self._sym_embeddings)
 
     def zero_grad(self):

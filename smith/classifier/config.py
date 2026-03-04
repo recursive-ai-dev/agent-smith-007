@@ -88,10 +88,23 @@ class AgentSmithConfig:
     checkpoint_freq: int = 200
 
     def __post_init__(self):
-        assert self.num_heads * self.d_k <= self.d_model, (
-            "num_heads × d_k must be ≤ d_model "
-            f"({self.num_heads}×{self.d_k}={self.num_heads*self.d_k} > {self.d_model})"
-        )
-        assert len(self.domains) == self.num_classes, (
-            f"len(domains)={len(self.domains)} ≠ num_classes={self.num_classes}"
-        )
+        if self.num_heads * self.d_k > self.d_model:
+            raise ValueError(
+                "num_heads × d_k must be ≤ d_model "
+                f"({self.num_heads}×{self.d_k}={self.num_heads*self.d_k} > {self.d_model})"
+            )
+        if len(self.domains) != self.num_classes:
+            raise ValueError(
+                f"len(domains)={len(self.domains)} ≠ num_classes={self.num_classes}"
+            )
+        if not isinstance(self.sep_chunk_size, int) or self.sep_chunk_size <= 0:
+            raise ValueError(
+                f"sep_chunk_size must be an int > 0, got {self.sep_chunk_size!r}"
+            )
+        if not self.gsar_window_sizes:
+            raise ValueError("gsar_window_sizes must be a non-empty iterable of ints > 0")
+        for w in self.gsar_window_sizes:
+            if not isinstance(w, int) or w <= 0:
+                raise ValueError(
+                    f"gsar_window_sizes must contain ints > 0, got {w!r}"
+                )

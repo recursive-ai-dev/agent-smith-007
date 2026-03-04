@@ -114,6 +114,11 @@ class SEP:
         chunk_size: int = 32,
         lambda_: float = 0.15,
     ):
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError(
+                f"chunk_size must be an int > 0 to prevent a non-terminating "
+                f"loop in SEP.forward(); got {chunk_size!r}"
+            )
         self.d_model     = d_model
         self.num_classes = num_classes
         self.chunk_size  = chunk_size
@@ -141,6 +146,10 @@ class SEP:
         logits      : NanoTensor [num_classes]
         explanation : dict with per-chunk diagnostics
         """
+        if not hidden_states:
+            raise ValueError(
+                "SEP.forward: hidden_states must be non-empty"
+            )
         T = len(hidden_states)
         K = self.chunk_size
 

@@ -164,6 +164,19 @@ class AdamOptimizer:
             "step":         self.step_count,
         }
 
+    def register_param(self, param: NanoTensor):
+        """
+        Register a new parameter after construction.
+        Appends to self.params and initialises its moment vectors to zero.
+        Call this whenever a new learnable NanoTensor is created (e.g. a
+        newly registered GSAR symbol embedding) so that it receives updates.
+        """
+        if not param.requires_grad:
+            return
+        self.params.append(param)
+        self._m.append([0.0] * len(param.data))
+        self._v.append([0.0] * len(param.data))
+
     def zero_grad(self):
         """Zero all parameter gradients (and Kahan error accumulators)."""
         for p in self.params:
