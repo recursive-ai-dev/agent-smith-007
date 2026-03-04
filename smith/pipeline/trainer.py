@@ -245,7 +245,7 @@ class Trainer:
                     epoch_seqs.append(seq)
 
                 # Periodic step-based checkpoint
-                if self.global_step % self.config.checkpoint_freq == 0:
+                if self.config.checkpoint_freq and self.global_step % self.config.checkpoint_freq == 0:
                     self._save_checkpoint(f"ckpt_step{self.global_step}.json")
 
                 # Diagnostic callbacks

@@ -97,7 +97,7 @@ class MixedPrecisionContext:
             raise ValueError(
                 f"unsupported bits: {bits}; supported: {allowed}"
             )
-        self._rounder   = _ROUNDERS.get(self.bits, _ROUNDERS[64])
+        self._rounder   = _ROUNDERS[self.bits]
 
         # Track overflow detection
         self._overflow_detected: bool = False

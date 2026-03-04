@@ -173,6 +173,8 @@ class AdamOptimizer:
         """
         if not param.requires_grad:
             return
+        if any(p is param for p in self.params):
+            return  # already registered — prevent duplicate updates
         self.params.append(param)
         self._m.append([0.0] * len(param.data))
         self._v.append([0.0] * len(param.data))

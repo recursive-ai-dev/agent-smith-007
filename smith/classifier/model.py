@@ -349,7 +349,7 @@ class AgentSmith:
     def _fire_backward_hooks(self, name: str, grad_input, grad_output):
         for fn in list(self._backward_hooks):
             try:
-                fn(self, grad_input, grad_output)
+                fn(grad_input, grad_output)
             except Exception as e:
                 logger.error("backward hook %s failed for %s: %s", fn, name, e, exc_info=True)
 
@@ -370,14 +370,17 @@ class AgentSmith:
     def load_state_dict(self, sd: dict):
         """Restore parameter values from state_dict."""
         params = self.parameters()
+        missing = [str(i) for i in range(len(params)) if str(i) not in sd]
+        if missing:
+            raise RuntimeError(
+                f"load_state_dict: checkpoint is missing parameters: {missing}"
+            )
         for i, p in enumerate(params):
             key = str(i)
-            if key not in sd:
-                continue
             saved = list(sd[key])
             if len(saved) != len(p.data):
                 raise ValueError(
-                    f"load_state_dict: parameter {key} size mismatch — "
+                    f"load_state_dict: parameter {key} size mismatch -- "
                     f"expected {len(p.data)}, got {len(saved)}"
                 )
             for j in range(len(p.data)):

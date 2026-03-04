@@ -90,12 +90,12 @@ class AgentSmithConfig:
     def __post_init__(self):
         if self.num_heads * self.d_k > self.d_model:
             raise ValueError(
-                "num_heads × d_k must be ≤ d_model "
-                f"({self.num_heads}×{self.d_k}={self.num_heads*self.d_k} > {self.d_model})"
+                "num_heads x d_k must be <= d_model "
+                f"({self.num_heads}x{self.d_k}={self.num_heads*self.d_k} > {self.d_model})"
             )
         if len(self.domains) != self.num_classes:
             raise ValueError(
-                f"len(domains)={len(self.domains)} ≠ num_classes={self.num_classes}"
+                f"len(domains)={len(self.domains)} != num_classes={self.num_classes}"
             )
         if not isinstance(self.sep_chunk_size, int) or self.sep_chunk_size <= 0:
             raise ValueError(

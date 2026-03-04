@@ -200,6 +200,8 @@ class Dataset:
                  has_header: bool = True,
                  num_classes: Optional[int] = None) -> 'Dataset':
         """Load from a CSV file with text and integer label columns."""
+        if num_classes is not None and (not isinstance(num_classes, int) or num_classes <= 0):
+            raise ValueError(f"num_classes must be a positive int or None, got {num_classes!r}")
         samples = []
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
@@ -222,6 +224,8 @@ class Dataset:
     def from_txt(cls, path: str,
                  num_classes: Optional[int] = None) -> 'Dataset':
         """Load from a two-column TSV: label<TAB>text."""
+        if num_classes is not None and (not isinstance(num_classes, int) or num_classes <= 0):
+            raise ValueError(f"num_classes must be a positive int or None, got {num_classes!r}")
         samples = []
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -243,10 +247,15 @@ class Dataset:
         rng.shuffle(self.samples)
         return self
 
-    def split(self, val_fraction: float = 0.1) -> Tuple['Dataset', 'Dataset']:
+    def split(self, val_fraction: float = 0.1, *, seed: Optional[int] = None) -> Tuple['Dataset', 'Dataset']:
         """Split into (shuffled) train and validation sets."""
+        if len(self.samples) < 2:
+            raise ValueError(
+                f"split() requires at least 2 samples; dataset has {len(self.samples)}"
+            )
         samples = self.samples[:]
-        random.shuffle(samples)
+        rng = random.Random(seed)
+        rng.shuffle(samples)
         n_val = int(round(len(samples) * val_fraction))
         n_val = max(1, min(n_val, len(samples) - 1))
         val   = Dataset(samples[:n_val])
