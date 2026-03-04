@@ -34,23 +34,23 @@ from .stiv import (
 
 __version__ = "0.1.0"
 __all__ = [
+    "Betaconcept",
+    "Concept",
+    "DomainError",
+    "GatedRecurrentUnit",
     "NanoTensor",
     "PatternMatcher",
-    "Token",
-    "SymbolicDB",
-    "GatedRecurrentUnit",
-    "Trainer",
-    "Concept",
-    "Subconcept",
-    "Betaconcept",
-    "SimpleSemanticEngine",
     "STIV",
     "STIVConfig",
     "STIVState",
+    "SimpleSemanticEngine",
+    "Subconcept",
+    "SymbolicDB",
+    "Token",
+    "TrafficCorpusBuilder",
+    "Trainer",
     "Validator",
     "ValidatorConfig",
-    "DomainError",
-    "TrafficCorpusBuilder",
 ]
 
 if SafetensorCheckpoint is not None:
