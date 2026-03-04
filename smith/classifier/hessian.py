@@ -137,6 +137,15 @@ def hvp(
     This is the workhorse for large models where the full Hessian is
     impractical (e.g. conjugate-gradient Newton-Krylov solvers).
     """
+    if len(v) != len(theta):
+        raise ValueError(
+            f"hvp: v must have same length as theta "
+            f"(got len(v)={len(v)}, len(theta)={len(theta)})"
+        )
+    if not hasattr(v, '__getitem__'):
+        raise TypeError(
+            f"hvp: v must be an indexable sequence, got {type(v).__name__}"
+        )
     n = len(theta)
     theta_p = [theta[i] + eps * v[i] for i in range(n)]
     theta_m = [theta[i] - eps * v[i] for i in range(n)]
@@ -184,6 +193,8 @@ def gershgorin_bounds(H: List[List[float]]) -> Tuple[float, float]:
     O(n²) cost — no iterative solver required.
     """
     n = len(H)
+    if n == 0 or any(len(row) != n for row in H):
+        raise ValueError("H must be a non-empty square matrix")
     lo, hi = float('inf'), float('-inf')
     for i in range(n):
         r = sum(abs(H[i][j]) for j in range(n) if j != i)
@@ -204,10 +215,14 @@ def power_iteration(
     Convergence guaranteed for symmetric matrices (all real eigenvalues).
     """
     n = len(H)
+    if n == 0 or any(len(row) != n for row in H):
+        raise ValueError("H must be a non-empty square matrix")
     # Random initialisation
     import random
     v = [random.gauss(0, 1) for _ in range(n)]
     norm_v = math.sqrt(sum(x*x for x in v))
+    if norm_v < 1e-30:
+        raise ValueError("cannot normalize zero vector")
     v = [x / norm_v for x in v]
 
     lam = 0.0

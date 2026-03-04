@@ -349,22 +349,28 @@ class NanoTensor:
 
     def log(self):
         """Element-wise natural log.  ∂log(x_i)/∂x_i = 1/x_i."""
+        clamped = [x < 1e-30 for x in self.data]
         safe = [max(x, 1e-30) for x in self.data]
         out = NanoTensor([math.log(s) for s in safe], _parents=(self,), _op='log')
         def _backward():
             if self.requires_grad:
                 for i in range(len(self.grad)):
+                    if clamped[i]:
+                        continue  # zero gradient for originally invalid inputs
                     self._accumulate_grad(i, (1.0 / safe[i]) * out.grad[i])
         out._backward = _backward
         return out
 
     def sqrt(self):
         """Element-wise sqrt(x).  ∂sqrt(x_i)/∂x_i = 1 / (2*sqrt(x_i))."""
+        clamped = [x < 1e-30 for x in self.data]
         safe = [max(x, 1e-30) for x in self.data]
         out = NanoTensor([math.sqrt(s) for s in safe], _parents=(self,), _op='sqrt')
         def _backward():
             if self.requires_grad:
                 for i in range(len(self.grad)):
+                    if clamped[i]:
+                        continue  # zero gradient for originally invalid inputs
                     self._accumulate_grad(i, 0.5 / out.data[i] * out.grad[i])
         out._backward = _backward
         return out
@@ -386,6 +392,8 @@ class NanoTensor:
     def mean(self):
         """Mean over all elements → scalar.  ∂mean/∂x_i = 1/n."""
         n = len(self.data)
+        if n == 0:
+            raise ValueError("Cannot compute mean of empty tensor")
         out = NanoTensor([sum(self.data) / n], _parents=(self,), _op='mean')
         def _backward():
             if self.requires_grad:

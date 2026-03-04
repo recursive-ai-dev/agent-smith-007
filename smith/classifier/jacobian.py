@@ -81,9 +81,16 @@ def jacobian(
         x_t = NanoTensor(x_data[:], requires_grad=True)
         outs = _run_with_tensor(forward_fn, x_t, m)
 
-        if outs is None or i >= len(outs):
-            J.append([0.0] * n)
-            continue
+        if outs is None:
+            raise RuntimeError(
+                f"jacobian: _run_with_tensor returned None for output index {i}; "
+                "forward_fn must accept NanoTensor-like inputs"
+            )
+        if i >= len(outs):
+            raise RuntimeError(
+                f"jacobian: output index {i} out of range (forward_fn returned "
+                f"{len(outs)} outputs)"
+            )
 
         # Seed gradient at output i
         out_i = outs[i]
@@ -120,9 +127,9 @@ def _run_with_tensor(
         if isinstance(result, NanoTensor):
             # scalar → wrap
             return [result]
-    except Exception:
-        pass
-    return None
+        return None
+    except (TypeError, AttributeError):
+        return None
 
 
 # ── Numerical Jacobian (finite differences) ─────────────────────────────────

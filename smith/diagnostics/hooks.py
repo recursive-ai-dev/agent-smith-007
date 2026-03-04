@@ -20,11 +20,14 @@ Usage
     print(diag.report())
 """
 
+import logging
 import math
 import os
 import json
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from ..classifier.model import AgentSmith
 from ..classifier.adam import AdamOptimizer
@@ -213,8 +216,9 @@ class DiagnosticsManager:
             stats = jacobian_stats([g]) if g else {}
             stats["step"] = step
             self.jacobian_history.append(stats)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Jacobian probe failed at step %d: %s", step, e, exc_info=True)
+            self.jacobian_history.append({"step": step, "error": str(e)})
         finally:
             # Restore weights
             for i, ii in enumerate(idx):
@@ -246,8 +250,9 @@ class DiagnosticsManager:
             summary = curvature_summary(scalar_loss, theta, sample_size=sample)
             summary["step"] = step
             self.hessian_history.append(summary)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Hessian probe failed at step %d: %s", step, e, exc_info=True)
+            self.hessian_history.append({"step": step, "error": str(e)})
         finally:
             for i, ii in enumerate(idx):
                 clf.weight.data[ii] = w_snap[ii]
@@ -287,19 +292,27 @@ class DiagnosticsManager:
         # Jacobian
         if self.jacobian_history:
             last_j = self.jacobian_history[-1]
+            frob = last_j.get('frobenius_norm')
+            j_max = last_j.get('max_abs')
+            frob_str = f"{frob:.4e}" if isinstance(frob, (int, float)) else 'n/a'
+            jmax_str = f"{j_max:.4e}" if isinstance(j_max, (int, float)) else 'n/a'
             lines.append(
                 f"  Jacobian (step {last_j.get('step')})  "
-                f"frob={last_j.get('frobenius_norm', 'n/a'):.4e}  "
-                f"max={last_j.get('max_abs', 'n/a'):.4e}"
+                f"frob={frob_str}  "
+                f"max={jmax_str}"
             )
 
         # Hessian
         if self.hessian_history:
             last_h = self.hessian_history[-1]
+            cond = last_h.get('condition_number_est')
+            mean_c = last_h.get('mean_curvature')
+            cond_str = f"{cond:.2f}" if isinstance(cond, (int, float)) else 'n/a'
+            meanc_str = f"{mean_c:.4e}" if isinstance(mean_c, (int, float)) else 'n/a'
             lines.append(
                 f"  Hessian (step {last_h.get('step')})  "
-                f"κ≈{last_h.get('condition_number_est', 'n/a'):.2f}  "
-                f"mean_curv={last_h.get('mean_curvature', 'n/a'):.4e}"
+                f"κ≈{cond_str}  "
+                f"mean_curv={meanc_str}"
             )
 
         # Activation summaries

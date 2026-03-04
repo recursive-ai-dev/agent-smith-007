@@ -198,10 +198,15 @@ class Trainer:
         }
 
         # ── Collect all token sequences for GSAR warm-up ─────────
+        pad_id = self.model.tokenizer.PAD
         all_sequences = []
         for text, _ in train_loader.dataset.samples:
             ids = self.model.tokenizer.encode(text)
-            all_sequences.append(ids)
+            # Strip trailing PAD tokens so GSAR sees real n-grams only
+            while ids and ids[-1] == pad_id:
+                ids.pop()
+            if ids:
+                all_sequences.append(ids)
 
         # Initial GSAR statistics pass (2 warm-up passes before first epoch)
         self.model.gsar.update_statistics(all_sequences)
@@ -209,7 +214,7 @@ class Trainer:
 
         if verbose:
             print(f"\n{'═'*65}")
-            print(f"  AGENT SMITH  — Training starts")
+            print("  AGENT SMITH  — Training starts")
             print(f"  Model params : {self.model.param_count():,}")
             print(f"  GSAR symbols : {len(self.model.gsar._registry)}")
             print(f"  Epochs       : {epochs}")
@@ -232,8 +237,16 @@ class Trainer:
                 epoch_losses.append(loss_val)
                 self.train_losses.append(loss_val)
 
-                # Collect token sequence for GSAR update
-                epoch_seqs.append(self.model.tokenizer.encode(text))
+                # Collect token sequence for GSAR update (strip PAD)
+                seq = self.model.tokenizer.encode(text)
+                while seq and seq[-1] == pad_id:
+                    seq.pop()
+                if seq:
+                    epoch_seqs.append(seq)
+
+                # Periodic step-based checkpoint
+                if self.config.checkpoint_freq and self.global_step % self.config.checkpoint_freq == 0:
+                    self._save_checkpoint(f"ckpt_step{self.global_step}.json")
 
                 # Diagnostic callbacks
                 sep_expl = step_diag.get("sep")
@@ -283,10 +296,6 @@ class Trainer:
                     f"new_syms={new_syms}  "
                     f"elapsed={elapsed:.1f}s\n"
                 )
-
-            # Periodic checkpoint
-            if self.global_step % self.config.checkpoint_freq == 0:
-                self._save_checkpoint(f"ckpt_step{self.global_step}.json")
 
         # Final diagnostics save
         self.diag.save("diagnostics.json")

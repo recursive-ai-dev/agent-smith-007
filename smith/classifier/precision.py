@@ -92,7 +92,12 @@ class MixedPrecisionContext:
         self.enabled    = enabled
         self.bits       = bits if enabled else 64
         self.loss_scale = loss_scale if enabled else 1.0
-        self._rounder   = _ROUNDERS.get(self.bits, _fp32_round)
+        if enabled and self.bits not in _ROUNDERS:
+            allowed = sorted(_ROUNDERS.keys())
+            raise ValueError(
+                f"unsupported bits: {bits}; supported: {allowed}"
+            )
+        self._rounder   = _ROUNDERS[self.bits]
 
         # Track overflow detection
         self._overflow_detected: bool = False

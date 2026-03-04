@@ -44,21 +44,19 @@ from .classifier import AgentSmith, AgentSmithConfig, DOMAINS
 
 __version__ = "0.2.0"
 __all__ = [
-    # Core NanoTensor
-    "NanoTensor",
-    "PatternMatcher",
-    "Token",
-    "SymbolicDB",
-    "GatedRecurrentUnit",
-    "Trainer",
-    "Concept",
-    "Subconcept",
-    "Betaconcept",
-    "SimpleSemanticEngine",
-    # AgentSmith classifier
     "AgentSmith",
     "AgentSmithConfig",
+    "Betaconcept",
+    "Concept",
     "DOMAINS",
+    "GatedRecurrentUnit",
+    "NanoTensor",
+    "PatternMatcher",
+    "SimpleSemanticEngine",
+    "Subconcept",
+    "SymbolicDB",
+    "Token",
+    "Trainer",
 ]
 
 if SafetensorCheckpoint is not None:
@@ -66,7 +64,11 @@ if SafetensorCheckpoint is not None:
 
 if _stiv_available:
     __all__.extend([
-        "STIV", "STIVConfig", "STIVState",
-        "Validator", "ValidatorConfig",
-        "DomainError", "TrafficCorpusBuilder",
+        "DomainError",
+        "STIV",
+        "STIVConfig",
+        "STIVState",
+        "TrafficCorpusBuilder",
+        "Validator",
+        "ValidatorConfig",
     ])

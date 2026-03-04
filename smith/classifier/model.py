@@ -32,10 +32,15 @@ Parameter count (default config):
 Scale d_model to 1024 and num_layers to 24 for ~1 billion parameters.
 """
 
+import hashlib
+import logging
 import math
+import re
 from typing import List, Optional, Tuple, Dict, Any
 
 from ..tensor import NanoTensor
+
+logger = logging.getLogger(__name__)
 from .config import AgentSmithConfig
 from .layers import (
     TokenEmbedding,
@@ -67,12 +72,12 @@ class Tokenizer:
         self.max_len    = max_len
 
     def encode(self, text: str) -> List[int]:
-        """Lowercase, split on whitespace/punctuation, hash each token."""
-        import re
-        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        """Lowercase, split on Unicode word chars, deterministic-hash each token."""
+        tokens = re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
         ids = []
         for tok in tokens[: self.max_len]:
-            h = hash(tok) % (self.vocab_size - 2) + 2   # map to [2, V-1]
+            digest = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
+            h = int.from_bytes(digest, "little") % (self.vocab_size - 2) + 2
             ids.append(h)
         # Pad if necessary
         ids = ids + [self.PAD] * (self.max_len - len(ids))
@@ -335,11 +340,23 @@ class AgentSmith:
         self._backward_hooks.append(fn)
 
     def _fire_forward_hooks(self, name: str, data):
-        for fn in self._forward_hooks:
+        for fn in list(self._forward_hooks):
             try:
                 fn(name, data)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("forward hook %s failed for %s: %s", fn, name, e, exc_info=True)
+
+    def _fire_backward_hooks(self, name: str, grad_input, grad_output):
+        for fn in list(self._backward_hooks):
+            try:
+                fn(grad_input, grad_output)
+            except Exception as e:
+                logger.error("backward hook %s failed for %s: %s", fn, name, e, exc_info=True)
+
+    def backward(self, loss):
+        """Run backward pass on loss and fire all registered backward hooks."""
+        loss.backward()
+        self._fire_backward_hooks("loss", None, None)
 
     # ── Checkpoint (plain JSON-serialisable) ──────────────────────────
 
@@ -353,10 +370,21 @@ class AgentSmith:
     def load_state_dict(self, sd: dict):
         """Restore parameter values from state_dict."""
         params = self.parameters()
+        missing = [str(i) for i in range(len(params)) if str(i) not in sd]
+        if missing:
+            raise RuntimeError(
+                f"load_state_dict: checkpoint is missing parameters: {missing}"
+            )
         for i, p in enumerate(params):
             key = str(i)
-            if key in sd:
-                p.data = list(sd[key])
+            saved = list(sd[key])
+            if len(saved) != len(p.data):
+                raise ValueError(
+                    f"load_state_dict: parameter {key} size mismatch -- "
+                    f"expected {len(p.data)}, got {len(saved)}"
+                )
+            for j in range(len(p.data)):
+                p.data[j] = saved[j]
 
     # ── String representation ─────────────────────────────────────────
 
