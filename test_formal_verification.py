@@ -15,7 +15,7 @@ class TestFormalVerification(unittest.TestCase):
         """Verify linearity of addition and multiplication gradients."""
         a = NanoTensor([1.0, 2.0], requires_grad=True)
         b = NanoTensor([3.0, 4.0], requires_grad=True)
-        c = (a * b) + a
+        c = ((a * b) + a).sum()
         c.backward()
         self.assertEqual(a.grad, [4.0, 5.0])
         self.assertEqual(b.grad, [1.0, 2.0])

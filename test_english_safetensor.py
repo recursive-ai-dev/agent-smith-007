@@ -15,7 +15,7 @@ from smith import (
     NanoTensor,
     SafetensorCheckpoint,
     SymbolicDB,
-    SymbolicRNN,
+    GatedRecurrentUnit as SymbolicRNN,
     Trainer
 )
 from smith.english_data import (
