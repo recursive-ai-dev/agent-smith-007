@@ -1,167 +1,69 @@
 """
-Symbolic Database - Self-Hosted Model Persistence
-
-SQLite-based database for storing model states, training history,
-and generated text with symbolic representations.
-Deterministic Hardening: Causal versioning and content-addressable storage.
+Symbolic Database
+=================
+SQLite persistence for model checkpoints and GSAR symbolic registries.
+Ensures model state is recoverable across sessions.
 """
 
-import json
 import sqlite3
-import hashlib
-import time
-from pathlib import Path
-from typing import Dict, List, Optional, Any
+import json
+import logging
+from typing import Optional, Any, Dict
 
-from .tensor import NanoTensor
-
+logger = logging.getLogger(__name__)
 
 class SymbolicDB:
     """
-    Self-hosted database using SQLite with algebraic operations.
-    Stores model states, training history, and generated text symbolically.
+    SQLite-backed storage for model weights and structural metadata.
     """
-    
-    def __init__(self, db_path: str = "symbolic_ai.db"):
-        self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(self.db_path)
-        self._init_schema()
-        # Initialize logical clock (version counter)
-        self._version_counter = 0
-        self._refresh_version_counter()
-    
-    def _refresh_version_counter(self):
-        """Update the logical version counter from existing data."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT MAX(id) FROM model_params")
-        row = cursor.fetchone()
-        if row and row[0] is not None:
-            self._version_counter = row[0]
-        else:
-            self._version_counter = 0
+    def __init__(self, db_path: str = "smith_archive.db"):
+        self.db_path = db_path
+        self._init_db()
 
-    def _init_schema(self):
-        """Initialize database schema with symbolic representations"""
-        cursor = self.conn.cursor()
-        
-        # Store model parameters as symbolic expressions
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS model_params (
-                id INTEGER PRIMARY KEY,
-                param_key TEXT UNIQUE,
-                data BLOB,
-                checksum TEXT,
-                logical_version INTEGER,
-                timestamp REAL
-            )
-        """)
-        
-        # Store training history with pattern metadata
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS training_log (
-                id INTEGER PRIMARY KEY,
-                epoch INTEGER,
-                loss REAL,
-                grad_norm REAL,
-                pattern_signature TEXT,
-                logical_version INTEGER,
-                timestamp REAL
-            )
-        """)
-        
-        # Store generated text samples
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS generations (
-                id INTEGER PRIMARY KEY,
-                seed_text TEXT,
-                generated_text TEXT,
-                config JSON,
-                quality_score REAL,
-                logical_version INTEGER,
-                timestamp REAL
-            )
-        """)
-        
-        self.conn.commit()
-    
-    def save_params(self, params: Dict[str, NanoTensor]) -> str:
-        """Save model parameters with algebraic checksum and logical versioning."""
-        cursor = self.conn.cursor()
-        
-        # Deterministic serialization: sort keys
-        param_dict = {k: v.data for k, v in sorted(params.items())}
-        serialized = json.dumps(param_dict).encode()
-        checksum = hashlib.sha256(serialized).hexdigest()
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS checkpoints (
+                        id TEXT PRIMARY KEY,
+                        metadata TEXT,
+                        weights BLOB
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS registry (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
+            logger.info("Database initialized at %s", self.db_path)
+        except sqlite3.Error as e:
+            logger.error("Database initialization failed: %s", e)
+            raise
 
-        # Use checksum as part of the key for content-addressable storage
-        self._version_counter += 1
-        param_key = f"v{self._version_counter}_{checksum[:8]}"
-        
-        cursor.execute(
-            "INSERT INTO model_params (param_key, data, checksum, logical_version, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (param_key, serialized, checksum, self._version_counter, time.time())
-        )
-        self.conn.commit()
-        return param_key
-    
-    def load_params(self, param_key: str) -> Optional[Dict[str, List[float]]]:
-        """Load model parameters by key"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT data FROM model_params WHERE param_key = ?", (param_key,))
-        result = cursor.fetchone()
-        if result:
-            return json.loads(result[0].decode())
+    def save_checkpoint(self, checkpoint_id: str, metadata: Dict[str, Any], weights: bytes):
+        """Save a binary weights blob with JSON metadata."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO checkpoints (id, metadata, weights) VALUES (?, ?, ?)",
+                    (checkpoint_id, json.dumps(metadata), weights)
+                )
+        except sqlite3.Error as e:
+            logger.error("Failed to save checkpoint %s: %s", checkpoint_id, e)
+
+    def load_checkpoint(self, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve checkpoint metadata and weights."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("SELECT metadata, weights FROM checkpoints WHERE id = ?", (checkpoint_id,))
+                row = cursor.fetchone()
+                if row:
+                    return {"metadata": json.loads(row[0]), "weights": row[1]}
+        except sqlite3.Error as e:
+            logger.error("Failed to load checkpoint %s: %s", checkpoint_id, e)
         return None
-    
-    def log_training(self, epoch: int, loss: float, grad_norm: float, pattern: str):
-        """Log training metrics with causal versioning"""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "INSERT INTO training_log (epoch, loss, grad_norm, pattern_signature, logical_version, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (epoch, loss, grad_norm, pattern, self._version_counter, time.time())
-        )
-        self.conn.commit()
-    
-    def store_generation(self, seed: str, text: str, config: Dict[str, Any], quality: float):
-        """Store generated text with configuration and logical version"""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "INSERT INTO generations (seed_text, generated_text, config, quality_score, logical_version, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (seed, text, json.dumps(config), quality, self._version_counter, time.time())
-        )
-        self.conn.commit()
-    
-    def get_best_generation(self) -> Optional[Dict[str, Any]]:
-        """Retrieve highest quality generation using symbolic query"""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT seed_text, generated_text, config, quality_score FROM generations "
-            "ORDER BY quality_score DESC LIMIT 1"
-        )
-        result = cursor.fetchone()
-        if result:
-            return {
-                "seed": result[0],
-                "text": result[1],
-                "config": json.loads(result[2]),
-                "quality": result[3]
-            }
-        return None
-    
-    def get_training_history(self) -> List[Dict[str, Any]]:
-        """Retrieve training history for analysis"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT epoch, loss, grad_norm, pattern_signature, timestamp, logical_version FROM training_log ORDER BY epoch")
-        results = cursor.fetchall()
-        return [{
-            "epoch": r[0],
-            "loss": r[1],
-            "grad_norm": r[2],
-            "pattern": r[3],
-            "timestamp": r[4],
-            "version": r[5]
-        } for r in results]
-    
+
     def close(self):
-        """Close database connection"""
-        self.conn.close()
+        """No-op for connect-per-call pattern, included for API completeness."""
+        pass

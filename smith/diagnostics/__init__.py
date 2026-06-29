@@ -1,4 +1,1 @@
-"""AgentSmith diagnostic hooks."""
-from .hooks import DiagnosticsManager
-
-__all__ = ["DiagnosticsManager"]
+from .hooks import logging_hook

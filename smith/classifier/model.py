@@ -9,38 +9,16 @@ Full forward pass:
          → SEP module   (chunked prediction + spurious-correlation detection)
          → softmax probabilities  +  SEP explanation
 
-Architecture is parameterised entirely by AgentSmithConfig.  The model
-is domain-agnostic in structure; the 12-way classification targets are
-listed in config.domains.
-
-Parameter count (default config):
-  TokenEmbedding   : vocab_size × d_model   = 4096 × 128  = 524 288
-  PositionalEnc    : non-learnable           = 0
-  per TransformerBlock:
-    MHA (4 heads × 3 projections × d_k×d_model + W_O):
-      = 4 × (32×128 + 32×128 + 32×128) + (128×128+128) = 49 280
-    FFN (d_model→d_ff→d_model + biases):
-      = 128×256+256 + 256×128+128       = 66 176
-    LayerNorm ×2:  4 × d_model          =    512
-    Block total                          ≈ 115 968
-  3 blocks                               = 347 904
-  GSAR symbol embeddings (up to 512):    = 512 × 128 = 65 536
-  SEP classifiers (2 × d_model×C+C):    = 2×(128×12+12) = 3 096
-  ─────────────────────────────────────────────────────
-  Total (approx.)                        ≈ 940 824  (~1M params)
-
-Scale d_model to 1024 and num_layers to 24 for ~1 billion parameters.
+Architecture is parameterised entirely by AgentSmithConfig.
 """
 
 import hashlib
 import logging
 import math
 import re
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Callable, Union
 
 from ..tensor import NanoTensor
-
-logger = logging.getLogger(__name__)
 from .config import AgentSmithConfig
 from .layers import (
     TokenEmbedding,
@@ -51,6 +29,8 @@ from .layers import (
 )
 from ..tools.gsar import GSAR
 from ..tools.sep import SEP
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,14 +56,17 @@ class Tokenizer:
         tokens = re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
         ids = []
         for tok in tokens[: self.max_len]:
+            # Use BLAKE2b for fast deterministic hashing
             digest = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
             h = int.from_bytes(digest, "little") % (self.vocab_size - 2) + 2
             ids.append(h)
-        # Pad if necessary
-        ids = ids + [self.PAD] * (self.max_len - len(ids))
-        return ids
+        # Pad sequence to max_len
+        if len(ids) < self.max_len:
+            ids.extend([self.PAD] * (self.max_len - len(ids)))
+        return ids[:self.max_len]
 
     def encode_batch(self, texts: List[str]) -> List[List[int]]:
+        """Encode multiple texts in a batch."""
         return [self.encode(t) for t in texts]
 
 
@@ -98,21 +81,19 @@ class AgentSmith:
     Components
     ----------
     • TokenEmbedding + sinusoidal PositionalEncoding
-    • GSAR layer (symbolic n-gram compression)
-    • N × TransformerBlock (pre-norm MHA + FFN)
-    • Final LayerNorm
-    • SEP module (chunked perception, spurious-correlation filtering)
-    • Output: class logits + softmax probabilities + SEP explanation
+    • GSAR: General Symbolic Arrays Reasoning (compression)
+    • TransformerBlocks: Encoder stack
+    • SEP: Self-Explanatory Perception (output & explanation)
     """
 
     def __init__(self, config: AgentSmithConfig):
         self.config = config
 
-        # ── Embedding ──────────────────────────────────────────────────
+        # ── 1. Embeddings ──────────────────────────────────────────────
         self.token_emb = TokenEmbedding(config.vocab_size, config.d_model)
         self.pos_enc   = PositionalEncoding(config.d_model, config.max_seq_len)
 
-        # ── GSAR ───────────────────────────────────────────────────────
+        # ── 2. GSAR Compression ────────────────────────────────────────
         self.gsar = GSAR(
             d_model            = config.d_model,
             vocab_size         = config.vocab_size,
@@ -124,21 +105,22 @@ class AgentSmith:
             blend_alpha        = config.gsar_blend_alpha,
         )
 
-        # ── Transformer stack ──────────────────────────────────────────
+        # ── 3. Transformer Stack ───────────────────────────────────────
         self.blocks = [
             TransformerBlock(
-                d_model   = config.d_model,
-                num_heads = config.num_heads,
-                d_k       = config.d_k,
-                d_v       = config.d_v,
-                d_ff      = config.d_ff,
-                eps       = config.layer_norm_eps,
+                d_model        = config.d_model,
+                num_heads      = config.num_heads,
+                d_k            = config.d_k,
+                d_v            = config.d_v,
+                d_ff           = config.d_ff,
+                eps            = config.layer_norm_eps,
             )
             for _ in range(config.num_layers)
         ]
-        self.final_norm = LayerNorm(config.d_model, config.layer_norm_eps)
 
-        # ── SEP ────────────────────────────────────────────────────────
+        # ── 4. Final Head ──────────────────────────────────────────────
+        self.final_norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
+
         self.sep = SEP(
             d_model     = config.d_model,
             num_classes = config.num_classes,
@@ -150,9 +132,8 @@ class AgentSmith:
         self.tokenizer = Tokenizer(config.vocab_size, config.max_seq_len)
 
         # ── Hook registry (for diagnostics) ───────────────────────────
-        # Each hook: callable(layer_name, tensor_data) → None
-        self._forward_hooks:  List[callable] = []
-        self._backward_hooks: List[callable] = []
+        self._forward_hooks:  List[Callable[[str, Any], None]] = []
+        self._backward_hooks: List[Callable[[Any, Any], None]] = []
 
     # ── Forward pass ────────────────────────────────────────────────────
 
@@ -162,38 +143,34 @@ class AgentSmith:
         use_gsar: bool = True,
     ) -> Tuple[NanoTensor, NanoTensor, Dict[str, Any]]:
         """
-        Parameters
-        ----------
-        token_ids : integer token IDs, length ≤ max_seq_len
-        use_gsar  : whether to apply GSAR compression (default True)
+        Run the full model forward pass.
 
         Returns
         -------
-        logits      : NanoTensor [num_classes]  (raw pre-softmax)
-        probs       : NanoTensor [num_classes]  (softmax probabilities)
-        diagnostics : dict with intermediate tensors and SEP explanation
+        logits      : NanoTensor [num_classes]
+        probs       : NanoTensor [num_classes]
+        diagnostics : dict with intermediate state and explanations
         """
         T = min(len(token_ids), self.config.max_seq_len)
         token_ids = token_ids[:T]
 
         # ── 1. Embedding + positional encoding ──────────────────────
         if use_gsar and self.gsar._registry:
-            # GSAR-compressed embeddings (variable length ≤ T)
+            # GSAR-compressed embeddings
             emb_list, is_sym, patterns = self.gsar.compress(
                 token_ids, self.token_emb
             )
-            # Add positional encoding to each position
+            # Add positional encoding
             hidden = [emb_list[i] + self.pos_enc(i) for i in range(len(emb_list))]
         else:
             # Standard embedding + positional
             hidden = [
                 self.token_emb(token_ids[i]) + self.pos_enc(i)
-                for i in range(T)
+                for i in range(len(token_ids))
             ]
-            is_sym   = [False] * T
-            patterns = [None] * T
+            is_sym   = [False] * len(token_ids)
+            patterns = [None] * len(token_ids)
 
-        # Fire forward hook: embeddings
         self._fire_forward_hooks("embeddings", [h.data for h in hidden])
 
         # ── 2. Transformer stack ───────────────────────────────────
@@ -208,20 +185,21 @@ class AgentSmith:
 
         # ── 4. SEP module ──────────────────────────────────────────
         logits, sep_explanation = self.sep.forward(hidden)
-        self._fire_forward_hooks("sep_logits", logits.data[:])
+        self._fire_forward_hooks("sep_logits", logits.data)
 
         # ── 5. Softmax probabilities ───────────────────────────────
         probs = logits.softmax()
 
         # ── Diagnostics bundle ─────────────────────────────────────
+        pred_class = probs.data.index(max(probs.data))
         diagnostics = {
             "sep": sep_explanation,
             "gsar_compressed_len": len(hidden),
             "gsar_original_len":   T,
             "gsar_compression_ratio": len(hidden) / max(T, 1),
             "gsar_symbol_positions": [i for i, s in enumerate(is_sym) if s],
-            "predicted_class": probs.data.index(max(probs.data)),
-            "predicted_domain": self.config.domains[probs.data.index(max(probs.data))],
+            "predicted_class": pred_class,
+            "predicted_domain": self.config.domains[pred_class],
         }
 
         return logits, probs, diagnostics
@@ -232,17 +210,7 @@ class AgentSmith:
     # ── Convenience: predict from raw text ────────────────────────────
 
     def predict(self, text: str) -> Dict[str, Any]:
-        """
-        End-to-end inference from raw text.
-
-        Returns dict with:
-          label     : predicted domain name
-          class_id  : predicted class index
-          probs     : list of class probabilities
-          confidence: max probability
-          explanation: SEP explanation string
-          diagnostics: full diagnostics dict
-        """
+        """End-to-end inference from raw text."""
         token_ids = self.tokenizer.encode(text)
         logits, probs, diagnostics = self.forward(token_ids)
 
@@ -264,39 +232,18 @@ class AgentSmith:
         target_class: int,
     ) -> NanoTensor:
         """
-        Cross-entropy loss:
-            L = −log softmax(logits)[target]
-              = −logits[target] + log(Σ_j exp(logits[j]))
-
-        Numerically stable via log-sum-exp:
-            L = −logits[target] + max + log(Σ_j exp(logits[j] − max))
+        Numerically stable cross-entropy loss with analytic backward pass.
+        L = −logits[target] + log(Σ exp(logits))
         """
         C    = len(logits.data)
-        maxv = max(logits.data)
+        if not 0 <= target_class < C:
+            raise ValueError(f"target_class {target_class} out of range for {C} classes")
 
-        # Σ exp(logits[j] − max)
-        exp_shifted = [math.exp(logits.data[j] - maxv) for j in range(C)]
+        maxv = max(logits.data)
+        exp_shifted = [math.exp(xi - maxv) for xi in logits.data]
         sum_exp     = sum(exp_shifted)
         log_sum_exp = maxv + math.log(sum_exp + 1e-30)
 
-        # −logits[target]
-        neg_target  = logits.extract(target_class, target_class + 1)
-        neg_target  = neg_target * NanoTensor([-1.0], requires_grad=False)
-
-        # log_sum_exp as a constant NanoTensor (no gradient)
-        lse_t = NanoTensor([log_sum_exp], requires_grad=False)
-
-        loss = neg_target + lse_t
-
-        # Backprop gradient through neg_target only (lse_t carries the
-        # full softmax gradient implicitly):
-        # ∂L/∂logits[j] = softmax(logits)[j] − 1(j == target)
-        # This is achieved by neg_target.backward() + a custom correction.
-        # We build a proper graph node that captures the full analytic gradient.
-
-        # ── Re-implement with full graph for correctness ──────────────
-        # Build a NanoTensor that represents the full cross-entropy,
-        # with the correct analytical backward.
         loss_val = log_sum_exp - logits.data[target_class]
         loss_nt  = NanoTensor([loss_val], _parents=(logits,), _op='xent')
 
@@ -304,8 +251,9 @@ class AgentSmith:
             if logits.requires_grad:
                 probs = [e / (sum_exp + 1e-30) for e in exp_shifted]
                 for j in range(C):
-                    grad = probs[j] - (1.0 if j == target_class else 0.0)
-                    logits._accumulate_grad(j, grad * loss_nt.grad[0])
+                    # ∂L/∂logits[j] = softmax(logits)[j] − 1(j == target)
+                    grad = (probs[j] - (1.0 if j == target_class else 0.0)) * loss_nt.grad[0]
+                    logits._accumulate_grad(j, grad)
 
         loss_nt._backward = _backward_xent
         return loss_nt
@@ -313,6 +261,7 @@ class AgentSmith:
     # ── Parameter management ──────────────────────────────────────────
 
     def parameters(self) -> List[NanoTensor]:
+        """Aggregate all learnable parameters in the model."""
         params: List[NanoTensor] = []
         params.extend(self.token_emb.parameters())
         for block in self.blocks:
@@ -323,20 +272,20 @@ class AgentSmith:
         return params
 
     def zero_grad(self):
+        """Zero all gradients in the model's parameters."""
         for p in self.parameters():
             p.zero_grad()
 
     def param_count(self) -> int:
+        """Total number of scalar parameters in the model."""
         return sum(len(p.data) for p in self.parameters())
 
     # ── Hooks ─────────────────────────────────────────────────────────
 
-    def register_forward_hook(self, fn: callable):
-        """Register a hook called as fn(layer_name, activation_data)."""
+    def register_forward_hook(self, fn: Callable[[str, Any], None]):
         self._forward_hooks.append(fn)
 
-    def register_backward_hook(self, fn: callable):
-        """Register a hook called after backward as fn(layer_name, grad_data)."""
+    def register_backward_hook(self, fn: Callable[[Any, Any], None]):
         self._backward_hooks.append(fn)
 
     def _fire_forward_hooks(self, name: str, data):
@@ -344,45 +293,41 @@ class AgentSmith:
             try:
                 fn(name, data)
             except Exception as e:
-                logger.error("forward hook %s failed for %s: %s", fn, name, e, exc_info=True)
+                logger.error("forward hook failed for %s: %s", name, e)
 
     def _fire_backward_hooks(self, name: str, grad_input, grad_output):
         for fn in list(self._backward_hooks):
             try:
                 fn(grad_input, grad_output)
             except Exception as e:
-                logger.error("backward hook %s failed for %s: %s", fn, name, e, exc_info=True)
+                logger.error("backward hook failed for %s: %s", name, e)
 
-    def backward(self, loss):
-        """Run backward pass on loss and fire all registered backward hooks."""
+    def backward(self, loss: NanoTensor):
+        """Run backward pass and fire registered hooks."""
         loss.backward()
         self._fire_backward_hooks("loss", None, None)
 
     # ── Checkpoint (plain JSON-serialisable) ──────────────────────────
 
-    def state_dict(self) -> dict:
-        """Serialise all parameter values."""
+    def state_dict(self) -> Dict[str, List[float]]:
+        """Snapshot all parameter values into a dictionary."""
         return {
             str(i): list(p.data)
             for i, p in enumerate(self.parameters())
         }
 
-    def load_state_dict(self, sd: dict):
-        """Restore parameter values from state_dict."""
+    def load_state_dict(self, sd: Dict[str, List[float]]):
+        """Restore parameter values from a state_dict snapshot."""
         params = self.parameters()
-        missing = [str(i) for i in range(len(params)) if str(i) not in sd]
-        if missing:
-            raise RuntimeError(
-                f"load_state_dict: checkpoint is missing parameters: {missing}"
-            )
         for i, p in enumerate(params):
             key = str(i)
+            if key not in sd:
+                raise RuntimeError(f"load_state_dict: missing key {key}")
+
             saved = list(sd[key])
             if len(saved) != len(p.data):
-                raise ValueError(
-                    f"load_state_dict: parameter {key} size mismatch -- "
-                    f"expected {len(p.data)}, got {len(saved)}"
-                )
+                raise ValueError(f"load_state_dict: size mismatch for key {key}")
+
             for j in range(len(p.data)):
                 p.data[j] = saved[j]
 

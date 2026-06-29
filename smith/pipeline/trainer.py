@@ -1,325 +1,152 @@
 """
-Training Pipeline
-==================
-Full training loop for AgentSmith.
-
-Implements:
-  • Epoch / step loop over a DataLoader
-  • Mixed-precision (simulated) forward + scaled backward
-  • Adam gradient step with warmup scheduling
-  • GSAR statistics update after every batch
-  • Diagnostic hook callbacks (loss, grads, Jacobian, Hessian)
-  • Periodic evaluation on validation set (accuracy + avg loss)
-  • Checkpoint save / restore
-  • Clean console logging
-
-Mathematics of the training update
-------------------------------------
-For each sample (x, y):
-  1. Tokenise x → token_ids
-  2. Forward:  logits, probs, diag = model(token_ids)
-  3. Loss:     L = CrossEntropy(logits, y)
-  4. (AMP)     L_scaled = S · L          where S = loss_scale
-  5. Backward: L_scaled.backward()
-  6. Unscale:  g ← g / S
-  7. Clip:     g ← g · min(1, clip / ‖g‖)
-  8. Adam:     θ ← θ − α [m̂ / (√v̂ + ε) + λθ]
+Pipeline Trainer — Production training loop
+==========================================
+Coordinates data loading, forward/backward passes,
+optimisation steps, and diagnostic logging.
 """
 
-import math
-import os
 import json
+import logging
+import os
 import time
-from typing import Optional, Tuple
+from typing import List, Dict, Any, Optional
 
-from ..tensor import NanoTensor
-from ..classifier.config import AgentSmithConfig
 from ..classifier.model import AgentSmith
 from ..classifier.adam import AdamOptimizer
-from ..classifier.precision import MixedPrecisionContext
-from ..pipeline.data import DataLoader, Dataset
-from ..diagnostics.hooks import DiagnosticsManager
+from ..classifier.precision import MixedPrecisionManager
+from .data import DataLoader
+
+logger = logging.getLogger(__name__)
 
 
-class Trainer:
+class PipelineTrainer:
     """
-    Orchestrates the complete training workflow.
-
-    Parameters
-    ----------
-    model      : AgentSmith instance
-    config     : AgentSmithConfig
-    log_dir    : directory for checkpoints and diagnostic logs
+    Standardized trainer for AgentSmith.
     """
 
     def __init__(
         self,
         model: AgentSmith,
-        config: AgentSmithConfig,
+        optimizer: AdamOptimizer,
+        dataloader: DataLoader,
+        val_dataloader: Optional[DataLoader] = None,
+        amp: bool = False,
         log_dir: str = "logs",
     ):
-        self.model  = model
-        self.config = config
+        self.model = model
+        self.optimizer = optimizer
+        self.dataloader = dataloader
+        self.val_dataloader = val_dataloader
+        self.amp_manager = MixedPrecisionManager() if amp else None
         self.log_dir = log_dir
-        os.makedirs(log_dir, exist_ok=True)
 
-        # ── Optimiser ────────────────────────────────────────────────
-        self.optimizer = AdamOptimizer(
-            params        = model.parameters(),
-            lr            = config.lr,
-            beta1         = config.beta1,
-            beta2         = config.beta2,
-            eps           = config.adam_eps,
-            weight_decay  = config.weight_decay,
-            warmup_steps  = config.warmup_steps,
-            grad_clip     = config.grad_clip,
-        )
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
 
-        # ── Mixed precision ───────────────────────────────────────────
-        self.amp = MixedPrecisionContext(
-            enabled    = config.use_amp,
-            bits       = config.amp_bits,
-            loss_scale = config.loss_scale,
-        )
+        self.history: List[Dict[str, Any]] = []
+        self.best_val_loss = float('inf')
 
-        # ── Diagnostics ───────────────────────────────────────────────
-        self.diag = DiagnosticsManager(
-            model   = model,
-            config  = config,
-            log_dir = log_dir,
-        )
-        model.register_forward_hook(self.diag.on_activation)
-
-        # ── State ─────────────────────────────────────────────────────
-        self.global_step:  int   = 0
-        self.best_val_acc: float = 0.0
-        self.train_losses: list  = []
-
-    # ── Core training step ───────────────────────────────────────────────
-
-    def _train_step(
-        self,
-        text: str,
-        label: int,
-    ) -> Tuple[float, dict]:
-        """
-        Single sample forward + backward + optimiser step.
-
-        Returns (loss_value: float, diagnostics: dict).
-        """
-        # ── 1. Tokenise ──────────────────────────────────────────
-        token_ids = self.model.tokenizer.encode(text)
-
-        # ── 2. Zero gradients ────────────────────────────────────
+    def train_epoch(self, epoch: int) -> float:
+        """Run one full epoch over the training data."""
         self.optimizer.zero_grad()
-
-        # ── 3. Forward pass (mixed precision) ────────────────────
-        with self.amp.forward():
-            logits, probs, diag = self.model.forward(token_ids, use_gsar=True)
-
-        # ── 4. Cross-entropy loss ─────────────────────────────────
-        loss = self.model.cross_entropy_loss(logits, label)
-
-        # ── 5. Loss scaling (AMP) ─────────────────────────────────
-        scaled_loss = self.amp.scale(loss)
-
-        # ── 6. Backward ───────────────────────────────────────────
-        scaled_loss.backward()
-
-        # ── 7. Unscale gradients ──────────────────────────────────
-        ok = self.amp.unscale(self.model.parameters())
-        if not ok:
-            # Gradient overflow → skip this step
-            return float('nan'), diag
-
-        # ── 8. Adam step (includes clipping and warmup) ───────────
-        opt_stats = self.optimizer.step()
-
-        loss_val = loss.data[0]
-        return loss_val, {**diag, **opt_stats}
-
-    # ── Evaluation ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _argmax(v: list) -> int:
-        return v.index(max(v))
-
-    def evaluate(self, loader: DataLoader) -> Tuple[float, float]:
-        """
-        Evaluate accuracy and average loss on a dataset.
-
-        Returns (accuracy: float, avg_loss: float).
-        """
-        correct = 0
-        total   = 0
         total_loss = 0.0
+        start_time = time.time()
 
-        for text, label in loader:
+        for i, (text, label) in enumerate(self.dataloader):
             token_ids = self.model.tokenizer.encode(text)
-            logits, probs, _ = self.model.forward(token_ids, use_gsar=False)
-            pred = self._argmax(probs.data)
-            correct += int(pred == label)
-            total   += 1
+
+            # Forward
+            logits, probs, diag = self.model.forward(token_ids)
             loss = self.model.cross_entropy_loss(logits, label)
+
+            # Scaled Backward
+            if self.amp_manager:
+                scaled_loss = self.amp_manager.scale_loss(loss)
+                scaled_loss.backward()
+                self.amp_manager.unscale_gradients(self.model.parameters())
+            else:
+                loss.backward()
+
+            # Optimizer step
+            if not self.amp_manager or not self.amp_manager.should_skip_step:
+                self.optimizer.step()
+                if self.amp_manager:
+                    self.amp_manager.update()
+
+            self.optimizer.zero_grad()
             total_loss += loss.data[0]
 
-        acc      = correct / max(total, 1)
-        avg_loss = total_loss / max(total, 1)
-        return acc, avg_loss
+            if i % 10 == 0:
+                elapsed = time.time() - start_time
+                logger.info(
+                    "Epoch %d | Batch %d/%d | Loss: %.4f | Speed: %.2f ms/sample",
+                    epoch, i, len(self.dataloader), loss.data[0],
+                    (elapsed / (i+1)) * 1000
+                )
 
-    # ── Main training loop ───────────────────────────────────────────────
+        return total_loss / len(self.dataloader)
 
-    def train(
-        self,
-        train_loader:  DataLoader,
-        val_loader:    Optional[DataLoader] = None,
-        num_epochs:    Optional[int] = None,
-        verbose:       bool = True,
-    ) -> dict:
-        """
-        Run the full training loop.
+    def validate(self) -> Dict[str, float]:
+        """Compute metrics on validation set."""
+        if not self.val_dataloader:
+            return {}
 
-        Parameters
-        ----------
-        train_loader  : DataLoader over training samples
-        val_loader    : optional DataLoader for validation
-        num_epochs    : override config.num_epochs if provided
-        verbose       : print per-epoch summary
+        total_loss = 0.0
+        correct = 0
+        total = 0
 
-        Returns
-        -------
-        history : dict with training statistics
-        """
-        epochs = num_epochs if num_epochs is not None else self.config.num_epochs
-        history: dict = {
-            "train_loss": [],
-            "val_acc":    [],
-            "val_loss":   [],
+        for text, label in self.val_dataloader:
+            token_ids = self.model.tokenizer.encode(text)
+            logits, probs, _ = self.model.forward(token_ids)
+            loss = self.model.cross_entropy_loss(logits, label)
+
+            total_loss += loss.data[0]
+            pred = probs.data.index(max(probs.data))
+            if pred == label:
+                correct += 1
+            total += 1
+
+        return {
+            "val_loss": total_loss / total,
+            "val_accuracy": correct / total
         }
 
-        # ── Collect all token sequences for GSAR warm-up ─────────
-        pad_id = self.model.tokenizer.PAD
-        all_sequences = []
-        for text, _ in train_loader.dataset.samples:
-            ids = self.model.tokenizer.encode(text)
-            # Strip trailing PAD tokens so GSAR sees real n-grams only
-            while ids and ids[-1] == pad_id:
-                ids.pop()
-            if ids:
-                all_sequences.append(ids)
+    def fit(self, epochs: int):
+        """Full training procedure."""
+        logger.info("Starting training: %d epochs, total params: %d",
+                    epochs, self.model.param_count())
 
-        # Initial GSAR statistics pass (2 warm-up passes before first epoch)
-        self.model.gsar.update_statistics(all_sequences)
-        self.model.gsar.update_statistics(all_sequences)
+        for epoch in range(epochs):
+            train_loss = self.train_epoch(epoch)
+            metrics = self.validate()
 
-        if verbose:
-            print(f"\n{'═'*65}")
-            print("  AGENT SMITH  — Training starts")
-            print(f"  Model params : {self.model.param_count():,}")
-            print(f"  GSAR symbols : {len(self.model.gsar._registry)}")
-            print(f"  Epochs       : {epochs}")
-            print(f"  Samples/epoch: {len(train_loader)}")
-            print(f"{'═'*65}\n")
+            summary = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                **metrics
+            }
+            self.history.append(summary)
 
-        for epoch in range(1, epochs + 1):
-            epoch_start = time.time()
-            epoch_losses = []
-            epoch_seqs   = []
+            logger.info("Epoch %d complete: %s", epoch, summary)
 
-            for text, label in train_loader:
-                self.global_step += 1
+            # Save best model
+            val_loss = metrics.get("val_loss", train_loss)
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_checkpoint("best_model.json")
 
-                # Training step
-                loss_val, step_diag = self._train_step(text, label)
+        # Final diagnostics export
+        with open(os.path.join(self.log_dir, "history.json"), "w") as f:
+            json.dump(self.history, f, indent=2)
 
-                if math.isnan(loss_val):
-                    continue
-                epoch_losses.append(loss_val)
-                self.train_losses.append(loss_val)
-
-                # Collect token sequence for GSAR update (strip PAD)
-                seq = self.model.tokenizer.encode(text)
-                while seq and seq[-1] == pad_id:
-                    seq.pop()
-                if seq:
-                    epoch_seqs.append(seq)
-
-                # Periodic step-based checkpoint
-                if self.config.checkpoint_freq and self.global_step % self.config.checkpoint_freq == 0:
-                    self._save_checkpoint(f"ckpt_step{self.global_step}.json")
-
-                # Diagnostic callbacks
-                sep_expl = step_diag.get("sep")
-                self.diag.after_step(
-                    step        = self.global_step,
-                    loss        = loss_val,
-                    optimizer   = self.optimizer,
-                    sep_explanation = sep_expl,
-                )
-
-                # Periodic console log
-                if verbose and self.global_step % 20 == 0:
-                    gn = self.diag.grad_norm_history[-1] if self.diag.grad_norm_history else 0
-                    print(
-                        f"  step={self.global_step:5d}  "
-                        f"loss={loss_val:.4f}  "
-                        f"‖∇‖={gn:.3e}  "
-                        f"lr={self.optimizer._current_lr():.2e}"
-                    )
-
-            # Update GSAR with epoch sequences
-            new_syms = self.model.gsar.update_statistics(epoch_seqs)
-
-            avg_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-            history["train_loss"].append(avg_loss)
-
-            # ── Validation ─────────────────────────────────────
-            val_acc, val_loss = 0.0, 0.0
-            if val_loader is not None:
-                val_acc, val_loss = self.evaluate(val_loader)
-                history["val_acc"].append(val_acc)
-                history["val_loss"].append(val_loss)
-
-                if val_acc > self.best_val_acc:
-                    self.best_val_acc = val_acc
-                    self._save_checkpoint("best_model.json")
-
-            elapsed = time.time() - epoch_start
-
-            if verbose:
-                syms = len(self.model.gsar._registry)
-                print(
-                    f"\n  Epoch {epoch:3d}/{epochs}  "
-                    f"train_loss={avg_loss:.4f}  "
-                    + (f"val_acc={val_acc:.3f}  val_loss={val_loss:.4f}  " if val_loader else "")
-                    + f"gsar_syms={syms}  "
-                    f"new_syms={new_syms}  "
-                    f"elapsed={elapsed:.1f}s\n"
-                )
-
-        # Final diagnostics save
-        self.diag.save("diagnostics.json")
-        if verbose:
-            print(self.diag.report())
-
-        return history
-
-    # ── Checkpoint helpers ────────────────────────────────────────────────
-
-    def _save_checkpoint(self, filename: str):
+    def save_checkpoint(self, filename: str):
+        """Persist model and optimizer state."""
         path = os.path.join(self.log_dir, filename)
-        ckpt = {
-            "model":     self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "step":      self.global_step,
+        checkpoint = {
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "config": self.model.config.__dict__
         }
         with open(path, "w") as f:
-            json.dump(ckpt, f)
-
-    def load_checkpoint(self, path: str):
-        with open(path) as f:
-            ckpt = json.load(f)
-        self.model.load_state_dict(ckpt["model"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.global_step = ckpt.get("step", 0)
-        print(f"Loaded checkpoint from {path}  (step={self.global_step})")
+            json.dump(checkpoint, f)
+        logger.info("Saved checkpoint to %s", path)

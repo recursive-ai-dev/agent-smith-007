@@ -1,209 +1,123 @@
 """
-Adam Optimiser (AdamW variant)
-==============================
-Implements the full Adam algorithm with:
-  • Per-parameter first-moment (m̂) and second-moment (v̂) estimates
-  • Bias-correction at every step:  m̂_t = m_t / (1 − β₁^t)
-                                     v̂_t = v_t / (1 − β₂^t)
-  • Decoupled weight decay (AdamW):  θ ← θ − λ θ  applied *before* the
-    gradient step, independent of the adaptive scaling
-  • Global gradient norm clipping before stepping
-  • Linear warm-up schedule for learning rate
+AdamW Optimizer — Adaptive Moment Estimation with Weight Decay
+==============================================================
+Pure-Python implementation for NanoTensor.
 
-Mathematics (per parameter θ with gradient g):
-    m_t  = β₁ m_{t−1} + (1−β₁) g_t
-    v_t  = β₂ v_{t−1} + (1−β₂) g_t²
-    m̂_t = m_t  / (1 − β₁^t)
-    v̂_t = v_t  / (1 − β₂^t)
-    θ_t  = θ_{t−1} − α_t [m̂_t / (√v̂_t + ε) + λ θ_{t−1}]
-
-Reference: Kingma & Ba 2015 (Adam); Loshchilov & Hutter 2019 (AdamW).
+Algorithm:
+  m_t = β₁ m_{t-1} + (1 - β₁) g_t
+  v_t = β₂ v_{t-1} + (1 - β₂) g_t²
+  m̂_t = m_t / (1 - β₁ᵗ)
+  v̂_t = v_t / (1 - β₂ᵗ)
+  θ_t = θ_t - η (m̂_t / (√v̂_t + ε) + λ θ_t)
 """
 
 import math
-from typing import List, Dict, Any
+import logging
+from typing import List, Dict, Optional, Any
 
 from ..tensor import NanoTensor
+
+logger = logging.getLogger(__name__)
 
 
 class AdamOptimizer:
     """
-    Adam / AdamW optimiser operating directly on NanoTensor parameters.
-
-    Parameters
-    ----------
-    params        : list of NanoTensor (all learnable parameters of the model)
-    lr            : base learning rate α
-    beta1         : exponential decay for first moment  (default 0.9)
-    beta2         : exponential decay for second moment (default 0.999)
-    eps           : numerical stability term (default 1e-8)
-    weight_decay  : decoupled L2 coefficient λ (default 0.01)
-    warmup_steps  : number of steps over which LR linearly ramps from 0 to lr
-    grad_clip     : maximum global gradient L2 norm (0 = no clipping)
+    AdamW optimizer with built-in warmup and gradient clipping.
     """
 
     def __init__(
         self,
         params: List[NanoTensor],
         lr: float = 1e-3,
-        beta1: float = 0.9,
-        beta2: float = 0.999,
+        betas: tuple = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
         warmup_steps: int = 0,
-        grad_clip: float = 1.0,
+        max_grad_norm: Optional[float] = 1.0,
     ):
-        self.params       = [p for p in params if p.requires_grad]
-        self.lr           = lr
-        self.beta1        = beta1
-        self.beta2        = beta2
-        self.eps          = eps
+        self.params = [p for p in params if p.requires_grad]
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
         self.weight_decay = weight_decay
-        self.warmup_steps = max(warmup_steps, 1)
-        self.grad_clip    = grad_clip
+        self.warmup_steps = warmup_steps
+        self.max_grad_norm = max_grad_norm
 
-        self.step_count: int = 0
+        self.t = 0
+        # State: m and v for each parameter
+        self.m: List[List[float]] = [[0.0] * len(p.data) for p in self.params]
+        self.v: List[List[float]] = [[0.0] * len(p.data) for p in self.params]
 
-        # First and second moment estimates, one list per parameter
-        self._m: List[List[float]] = [
-            [0.0] * len(p.data) for p in self.params
-        ]
-        self._v: List[List[float]] = [
-            [0.0] * len(p.data) for p in self.params
-        ]
-
-    # ── Utilities ────────────────────────────────────────────────────────
-
-    def _current_lr(self) -> float:
-        """Linear warm-up: lr scales from 0 → lr over warmup_steps."""
-        if self.step_count <= self.warmup_steps:
-            return self.lr * (self.step_count / self.warmup_steps)
+    def _get_lr(self) -> float:
+        """Apply linear warmup if configured."""
+        if self.t < self.warmup_steps:
+            return self.lr * (self.t + 1) / self.warmup_steps
         return self.lr
 
-    def global_grad_norm(self) -> float:
-        """L2 norm over all parameter gradients: ‖g‖₂."""
-        sq_sum = 0.0
+    def clip_gradients(self):
+        """Global gradient clipping by norm."""
+        if self.max_grad_norm is None:
+            return
+
+        total_norm_sq = 0.0
         for p in self.params:
             if p.grad:
-                sq_sum += sum(g * g for g in p.grad)
-        return math.sqrt(sq_sum)
+                total_norm_sq += sum(g * g for g in p.grad)
 
-    def clip_gradients(self) -> float:
-        """
-        In-place global gradient norm clipping.
-        Scales all gradients by min(1, grad_clip / ‖g‖₂).
-        Returns the pre-clip norm (useful for logging).
-        """
-        norm = self.global_grad_norm()
-        if self.grad_clip > 0 and norm > self.grad_clip:
-            scale = self.grad_clip / (norm + 1e-12)
+        total_norm = math.sqrt(total_norm_sq)
+        clip_coef = self.max_grad_norm / (total_norm + 1e-6)
+
+        if clip_coef < 1.0:
             for p in self.params:
                 if p.grad:
-                    p.grad = [g * scale for g in p.grad]
-        return norm
+                    for i in range(len(p.grad)):
+                        p.grad[i] *= clip_coef
 
-    # ── Core step ────────────────────────────────────────────────────────
+    def step(self):
+        """Perform a single optimization step."""
+        self.t += 1
+        lr = self._get_lr()
 
-    def step(self) -> Dict[str, Any]:
-        """
-        Execute one Adam update step.
+        # 1. Gradient clipping
+        self.clip_gradients()
 
-        Returns a dict of diagnostic scalars:
-          grad_norm     : pre-clip gradient L2 norm
-          effective_lr  : learning rate after warm-up schedule
-          max_update    : maximum absolute parameter change in this step
-        """
-        self.step_count += 1
-        alpha = self._current_lr()
-
-        # Gradient clipping
-        grad_norm = self.clip_gradients()
-
-        # Bias-correction denominators (computed once per step)
-        bc1 = 1.0 - self.beta1 ** self.step_count
-        bc2 = 1.0 - self.beta2 ** self.step_count
-
-        max_update = 0.0
-
-        for idx, p in enumerate(self.params):
-            if p.grad is None:
+        for i, p in enumerate(self.params):
+            if not p.grad:
                 continue
 
-            m = self._m[idx]
-            v = self._v[idx]
-            n = len(p.data)
+            for j in range(len(p.data)):
+                g = p.grad[j]
 
-            for i in range(n):
-                g = p.grad[i]
+                # 2. Update moments
+                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g
+                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * (g * g)
 
-                # ── First moment:  m_t = β₁ m_{t−1} + (1−β₁) g
-                m[i] = self.beta1 * m[i] + (1.0 - self.beta1) * g
+                # 3. Bias correction
+                m_hat = self.m[i][j] / (1.0 - self.beta1 ** self.t)
+                v_hat = self.v[i][j] / (1.0 - self.beta2 ** self.t)
 
-                # ── Second moment: v_t = β₂ v_{t−1} + (1−β₂) g²
-                v[i] = self.beta2 * v[i] + (1.0 - self.beta2) * g * g
-
-                # ── Bias-corrected estimates
-                m_hat = m[i] / bc1
-                v_hat = v[i] / bc2
-
-                # ── Adaptive step size
-                adaptive = m_hat / (math.sqrt(v_hat) + self.eps)
-
-                # ── Decoupled weight decay: θ ← θ − λ θ
-                decay = self.weight_decay * p.data[i]
-
-                # ── Parameter update: θ ← θ − α (adaptive + decay)
-                delta = alpha * (adaptive + decay)
-                p.data[i] -= delta
-                max_update = max(max_update, abs(delta))
-
-        return {
-            "grad_norm":    grad_norm,
-            "effective_lr": alpha,
-            "max_update":   max_update,
-            "step":         self.step_count,
-        }
-
-    def register_param(self, param: NanoTensor):
-        """
-        Register a new parameter after construction.
-        Appends to self.params and initialises its moment vectors to zero.
-        Call this whenever a new learnable NanoTensor is created (e.g. a
-        newly registered GSAR symbol embedding) so that it receives updates.
-        """
-        if not param.requires_grad:
-            return
-        if any(p is param for p in self.params):
-            return  # already registered — prevent duplicate updates
-        self.params.append(param)
-        self._m.append([0.0] * len(param.data))
-        self._v.append([0.0] * len(param.data))
+                # 4. Weight decay and parameter update
+                update = m_hat / (math.sqrt(v_hat) + self.eps)
+                p.data[j] -= lr * (update + self.weight_decay * p.data[j])
 
     def zero_grad(self):
-        """Zero all parameter gradients (and Kahan error accumulators)."""
+        """Reset gradients for all parameters."""
         for p in self.params:
             p.zero_grad()
 
-    # ── Serialisation ─────────────────────────────────────────────────
-
     def state_dict(self) -> Dict[str, Any]:
+        """Snapshot optimizer state."""
         return {
-            "step_count": self.step_count,
-            "m": [list(mi) for mi in self._m],
-            "v": [list(vi) for vi in self._v],
+            "t": self.t,
+            "m": [list(mi) for mi in self.m],
+            "v": [list(vi) for vi in self.v],
             "lr": self.lr,
-            "beta1": self.beta1,
-            "beta2": self.beta2,
-            "eps": self.eps,
-            "weight_decay": self.weight_decay,
         }
 
-    def load_state_dict(self, sd: Dict[str, Any]):
-        self.step_count   = sd["step_count"]
-        self._m           = [list(mi) for mi in sd["m"]]
-        self._v           = [list(vi) for vi in sd["v"]]
-        self.lr           = sd["lr"]
-        self.beta1        = sd["beta1"]
-        self.beta2        = sd["beta2"]
-        self.eps          = sd["eps"]
-        self.weight_decay = sd["weight_decay"]
+    def load_state_dict(self, state: Dict[str, Any]):
+        """Restore optimizer state."""
+        self.t = state["t"]
+        self.lr = state["lr"]
+        for i in range(len(self.params)):
+            self.m[i] = list(state["m"][i])
+            self.v[i] = list(state["v"][i])
