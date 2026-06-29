@@ -37,9 +37,20 @@ class AgentSmithAutoencoder(GatedRecurrentUnit):
 
     def load_clone(self, checkpoint_path="smith_clone"):
         checkpoint = SafetensorCheckpoint()
-        params, metadata = checkpoint.load_checkpoint(checkpoint_path)
-        for key, tensor in params.items():
-            self.params[key].data = tensor.data
+        params, _metadata = checkpoint.load_checkpoint(checkpoint_path)
+
+        expected_keys = set(self.params)
+        loaded_keys = set(params)
+        if loaded_keys != expected_keys:
+            raise ValueError(f"Checkpoint parameter mismatch: expected {expected_keys}, got {loaded_keys}")
+
+        for key, current in self.params.items():
+            loaded = params[key]
+            if len(loaded.data) != len(current.data):
+                raise ValueError(
+                    f"Checkpoint tensor size mismatch for {key}: expected {len(current.data)}, got {len(loaded.data)}"
+                )
+            current.data = loaded.data[:]
 
 def train_smith():
     print("Initializing Agent Smith (Anomaly Detection Autoencoder)...")
