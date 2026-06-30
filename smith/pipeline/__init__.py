@@ -1,5 +1,2 @@
-"""AgentSmith data and training pipelines."""
-from .data import Dataset, DataLoader, SYNTHETIC_DATA
-from .trainer import Trainer
-
-__all__ = ["Dataset", "DataLoader", "SYNTHETIC_DATA", "Trainer"]
+from .data import DataLoader, generate_dummy_data
+from .trainer import PipelineTrainer

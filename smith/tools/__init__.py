@@ -1,5 +1,2 @@
-"""AgentSmith hard-coded tools: GSAR and SEP."""
-from .gsar import GSAR, SymbolEntry
+from .gsar import GSAR
 from .sep import SEP
-
-__all__ = ["GSAR", "SymbolEntry", "SEP"]

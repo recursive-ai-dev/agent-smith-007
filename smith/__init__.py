@@ -1,6 +1,6 @@
 """
 Smith - Algebraic Symbolism Text Generation System
-
+==================================================
 A lightweight AI model implementation demonstrating:
 - Branchless operations using algebraic primitives
 - Structural pattern matching for control flow
@@ -15,6 +15,9 @@ from .pattern_matcher import PatternMatcher, Token
 from .database import SymbolicDB
 from .gru_model import GatedRecurrentUnit
 from .trainer import Trainer
+
+# Alias for backward compatibility with earlier versions
+SymbolicRNN = GatedRecurrentUnit
 
 try:
     from .checkpoint import SafetensorCheckpoint
@@ -39,10 +42,10 @@ except ImportError:
     STIV = STIVConfig = STIVState = Validator = ValidatorConfig = None
     DomainError = TrafficCorpusBuilder = None
 
-# ── AgentSmith classifier (new) ──────────────────────────────────────
+# ── AgentSmith classifier
 from .classifier import AgentSmith, AgentSmithConfig, DOMAINS
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "AgentSmith",
     "AgentSmithConfig",
@@ -50,6 +53,7 @@ __all__ = [
     "Concept",
     "DOMAINS",
     "GatedRecurrentUnit",
+    "SymbolicRNN",
     "NanoTensor",
     "PatternMatcher",
     "SimpleSemanticEngine",
@@ -57,6 +61,7 @@ __all__ = [
     "SymbolicDB",
     "Token",
     "Trainer",
+    "reset_global_state",
 ]
 
 if SafetensorCheckpoint is not None:
@@ -72,3 +77,7 @@ if _stiv_available:
         "Validator",
         "ValidatorConfig",
     ])
+
+def reset_global_state():
+    """Reset global state for deterministic execution runs."""
+    NanoTensor._global_index = 0

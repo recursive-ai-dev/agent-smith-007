@@ -16,7 +16,7 @@ Implemented:
 
 import math
 import random
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 from ..tensor import NanoTensor
 
@@ -27,11 +27,13 @@ from ..tensor import NanoTensor
 
 def _kaiming_uniform(fan_in: int, fan_out: int) -> List[float]:
     """Kaiming uniform initialisation for weights: U(−a, a), a = √(2/fan_in)."""
+    # Using fan_in for scale calculation as per Kaiming initialisation principles
     a = math.sqrt(2.0 / fan_in)
     return [random.uniform(-a, a) for _ in range(fan_out * fan_in)]
 
 
 def _zeros(n: int) -> List[float]:
+    """Return a list of n zeros."""
     return [0.0] * n
 
 
@@ -56,6 +58,7 @@ class Linear:
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
         self.out_features = out_features
+        # Flat weight representing (out_features, in_features)
         self.weight = NanoTensor(_kaiming_uniform(in_features, out_features))
         self.bias = NanoTensor(_zeros(out_features)) if bias else None
 
@@ -65,19 +68,23 @@ class Linear:
                 f"Linear: expected in_features={self.in_features}, "
                 f"got {len(x.data)}"
             )
+        # weight (out_features * in_features) matmul x (in_features) -> out (out_features)
         out = self.weight.matmul(x)
         if self.bias is not None:
             out = out + self.bias
         return out
 
     def parameters(self) -> List[NanoTensor]:
+        """Return all learnable parameters in this layer."""
         return [self.weight] + ([self.bias] if self.bias is not None else [])
 
     def zero_grad(self):
+        """Zero all parameter gradients."""
         for p in self.parameters():
             p.zero_grad()
 
     def param_count(self) -> int:
+        """Total number of scalar parameters."""
         n = self.in_features * self.out_features
         if self.bias is not None:
             n += self.out_features
@@ -99,6 +106,7 @@ class LayerNorm:
         ∂L/∂x_i = (1/σ) [∂L/∂x̂_i
                          − mean_j(∂L/∂x̂_j)
                          − x̂_i · mean_j(∂L/∂x̂_j · x̂_j)]
+
     The scale (γ) and shift (β) gradients flow through NanoTensor __mul__/__add__.
     """
 
@@ -117,16 +125,20 @@ class LayerNorm:
         x_hat_data = [(xi - mu) / sigma for xi in x.data]
 
         # Build NanoTensor with custom backward for the normalisation step
-        x_hat = NanoTensor(x_hat_data[:], _parents=(x,), _op='ln_norm')
+        x_hat = NanoTensor(x_hat_data, _parents=(x,), _op='ln_norm')
 
         def _backward_norm():
             if not x.requires_grad:
                 return
             n_ = len(x.data)
             g = x_hat.grad
+            # sum(∂L/∂x̂_j)
             g_sum = sum(g)
+            # sum(∂L/∂x̂_j · x̂_j)
             g_xhat_dot = sum(g[i] * x_hat_data[i] for i in range(n_))
+
             for i in range(n_):
+                # Efficient analytic gradient for LayerNorm
                 dx = (g[i] - g_sum / n_ - x_hat_data[i] * g_xhat_dot / n_) / sigma
                 x._accumulate_grad(i, dx)
 
@@ -136,9 +148,11 @@ class LayerNorm:
         return x_hat * self.gamma + self.beta
 
     def parameters(self) -> List[NanoTensor]:
+        """Return scale and shift parameters."""
         return [self.gamma, self.beta]
 
     def zero_grad(self):
+        """Zero scale and shift gradients."""
         for p in self.parameters():
             p.zero_grad()
 
@@ -172,6 +186,8 @@ class ScaledDotProductAttention:
         values: List[NanoTensor],
     ) -> NanoTensor:
         seq_len = len(keys)
+        if seq_len == 0:
+            raise ValueError("SDPA: keys list cannot be empty")
 
         # 1. Compute raw scores: s_j = q · k_j
         raw_scores = [query.matmul(kj) for kj in keys]  # list of [1] tensors
@@ -181,7 +197,7 @@ class ScaledDotProductAttention:
         for s in raw_scores[1:]:
             scores = scores.concat(s)
 
-        # 3. Scale
+        # 3. Scale scores by 1/√d_k
         scale_t = NanoTensor([self._scale.data[0]] * seq_len, requires_grad=False)
         scores_scaled = scores * scale_t
 
@@ -216,6 +232,7 @@ class MultiHeadAttention:
         self.d_k = d_k
         self.d_v = d_v
 
+        # Using Linear layers for projections
         self.W_Q = [Linear(d_model, d_k, bias=False) for _ in range(num_heads)]
         self.W_K = [Linear(d_model, d_k, bias=False) for _ in range(num_heads)]
         self.W_V = [Linear(d_model, d_v, bias=False) for _ in range(num_heads)]
@@ -225,6 +242,8 @@ class MultiHeadAttention:
 
     def __call__(self, hidden_states: List[NanoTensor]) -> List[NanoTensor]:
         T = len(hidden_states)
+        if T == 0:
+            return []
 
         # Pre-project keys and values for every head (shared across query positions)
         all_keys   = [[self.W_K[h](tok) for tok in hidden_states]
@@ -241,16 +260,17 @@ class MultiHeadAttention:
                 head_contexts.append(ctx)
 
             # Concatenate heads → [num_heads · d_v]
-            concat = head_contexts[0]
+            concat_res = head_contexts[0]
             for hc in head_contexts[1:]:
-                concat = concat.concat(hc)
+                concat_res = concat_res.concat(hc)
 
             # Project back to d_model
-            outputs.append(self.W_O(concat))
+            outputs.append(self.W_O(concat_res))
 
         return outputs
 
     def parameters(self) -> List[NanoTensor]:
+        """Return all learnable parameters for MHA."""
         params: List[NanoTensor] = []
         for h in range(self.num_heads):
             params.extend(self.W_Q[h].parameters())
@@ -260,6 +280,7 @@ class MultiHeadAttention:
         return params
 
     def zero_grad(self):
+        """Zero all gradients in MHA."""
         for p in self.parameters():
             p.zero_grad()
 
@@ -284,9 +305,11 @@ class FeedForward:
         return self.fc2(self.fc1(x).gelu())
 
     def parameters(self) -> List[NanoTensor]:
+        """Return learnable parameters for FFN."""
         return self.fc1.parameters() + self.fc2.parameters()
 
     def zero_grad(self):
+        """Zero all gradients in FFN."""
         for p in self.parameters():
             p.zero_grad()
 
@@ -316,19 +339,23 @@ class TransformerBlock:
         # ── Self-attention branch ──────────────────────────────────
         normed   = [self.norm1(h) for h in hidden_states]
         attn_out = self.attn(normed)
+        # Skip connection 1
         hidden_states = [h + a for h, a in zip(hidden_states, attn_out)]
 
         # ── Feed-forward branch ────────────────────────────────────
         out = []
         for h in hidden_states:
+            # Skip connection 2
             out.append(h + self.ff(self.norm2(h)))
         return out
 
     def parameters(self) -> List[NanoTensor]:
+        """Return all parameters in the block."""
         return (self.attn.parameters() + self.ff.parameters()
                 + self.norm1.parameters() + self.norm2.parameters())
 
     def zero_grad(self):
+        """Zero all gradients in the block."""
         for p in self.parameters():
             p.zero_grad()
 
@@ -347,20 +374,24 @@ class TokenEmbedding:
         self.vocab_size = vocab_size
         self.d_model = d_model
         scale = math.sqrt(1.0 / d_model)
-        # One NanoTensor per vocabulary entry
+        # One NanoTensor per vocabulary entry. While slightly heavier than a single flat tensor,
+        # it preserves the NanoTensor object-identity model for learnable parameters.
         self._table: List[NanoTensor] = [
             NanoTensor([random.gauss(0.0, scale) for _ in range(d_model)])
             for _ in range(vocab_size)
         ]
 
     def __call__(self, token_id: int) -> NanoTensor:
-        token_id = token_id % self.vocab_size
+        # Wrap-around indexing for safety
+        token_id = int(token_id) % self.vocab_size
         return self._table[token_id]
 
     def parameters(self) -> List[NanoTensor]:
+        """Return all embedding NanoTensors as learnable parameters."""
         return list(self._table)
 
     def zero_grad(self):
+        """Zero gradients for all embeddings."""
         for p in self._table:
             p.zero_grad()
 
@@ -381,9 +412,20 @@ class PositionalEncoding:
         for pos in range(max_len):
             pe = []
             for i in range(d_model):
-                angle = pos / (10000.0 ** (2 * (i // 2) / d_model))
+                # Scale denominator based on dimension index
+                div_term = math.exp( (i // 2) * -(math.log(10000.0) / d_model) )
+                angle = pos * div_term
                 pe.append(math.sin(angle) if i % 2 == 0 else math.cos(angle))
             self._cache.append(NanoTensor(pe, requires_grad=False))
 
     def __call__(self, pos: int) -> NanoTensor:
+        """Retrieve fixed PE for a given position."""
+        if pos >= len(self._cache):
+            # Dynamic generation if sequence length exceeds initial max_len
+            pe = []
+            for i in range(self.d_model):
+                div_term = math.exp( (i // 2) * -(math.log(10000.0) / self.d_model) )
+                angle = pos * div_term
+                pe.append(math.sin(angle) if i % 2 == 0 else math.cos(angle))
+            return NanoTensor(pe, requires_grad=False)
         return self._cache[pos]
